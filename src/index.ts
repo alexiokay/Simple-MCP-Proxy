@@ -289,31 +289,72 @@ function createMCPServer(): Server {
       {
         name: "discover_tools",
         description:
-          "Semantic search across all MCP tools. Always call this before execute_tool to find the right tool name and arguments.",
+          "Semantic search over all available MCP tools. Returns tools ranked by relevance, each with its exact name, " +
+          "description, relevance score (0–1), and inputSchema showing the required arguments. " +
+          "ALWAYS call this before execute_tool or batch_execute — it gives you the exact tool name and the argument " +
+          "schema you need to call it correctly. " +
+          "Tips: (1) use specific queries ('create a GitHub issue', 'list files in directory') not broad ones " +
+          "('do something with GitHub'); (2) call multiple times with different queries if your task spans multiple " +
+          "domains; (3) relevance above 0.7 is a strong match — below 0.5 the tool is likely unrelated.",
         inputSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Natural language description of what you want to do" },
-            limit: { type: "number", description: `Max results (default: ${DISCOVER_LIMIT})` },
+            query: { type: "string", description: "Specific natural language description of the operation you want to perform" },
+            limit: { type: "number", description: `Max results to return (default: ${DISCOVER_LIMIT}). Increase if results seem incomplete.` },
           },
           required: ["query"],
         },
       },
       {
         name: "execute_tool",
-        description: "Execute an MCP tool by its exact name with arguments.",
+        description:
+          "Execute a single MCP tool by its exact name with arguments matching its inputSchema. " +
+          "Always discover the tool first with discover_tools to get the exact name and required arguments. " +
+          "For multiple independent operations, call this tool in parallel rather than sequentially. " +
+          "For compound tasks that need several tools, prefer batch_execute to run them all in one call.",
         inputSchema: {
           type: "object",
           properties: {
-            tool_name: { type: "string", description: "Exact tool name from discover_tools" },
-            arguments: { type: "object", description: "Arguments matching the tool's inputSchema" },
+            tool_name: { type: "string", description: "Exact tool name as returned by discover_tools" },
+            arguments: { type: "object", description: "Arguments matching the tool's inputSchema (from discover_tools results)" },
           },
           required: ["tool_name", "arguments"],
         },
       },
       {
+        name: "batch_execute",
+        description:
+          "Execute multiple MCP tools in parallel in a single call. " +
+          "Each entry needs a tool_name (exact, from discover_tools) and its arguments. " +
+          "Results are returned in the same order as the calls array, each with success status. " +
+          "Use this for compound tasks where several tools can run independently " +
+          "(e.g. create a GitHub issue + add a label + post a Slack notification). " +
+          "Much faster than sequential execute_tool calls.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            calls: {
+              type: "array",
+              description: "Tools to execute in parallel",
+              items: {
+                type: "object",
+                properties: {
+                  tool_name: { type: "string", description: "Exact tool name from discover_tools" },
+                  arguments: { type: "object", description: "Arguments matching the tool's inputSchema" },
+                },
+                required: ["tool_name"],
+              },
+            },
+          },
+          required: ["calls"],
+        },
+      },
+      {
         name: "refresh_tools",
-        description: "Force re-index all tools from MCP Router right now.",
+        description:
+          "Force an immediate re-index of all tools from MCP Router. " +
+          "Use this if discover_tools is not returning tools you know should be available, " +
+          "or after adding a new MCP server to your router.",
         inputSchema: { type: "object", properties: {} },
       },
     ],
@@ -368,6 +409,40 @@ function createMCPServer(): Server {
       }
       const toolArgs = (args?.arguments ?? {}) as Record<string, unknown>;
       return await routerClient.callTool({ name: toolName, arguments: toolArgs });
+    }
+
+    if (name === "batch_execute") {
+      if (!routerClient || !routerConnected) {
+        return {
+          content: [{ type: "text", text: "MCP Router is not connected. Please wait for reconnection." }],
+          isError: true,
+        };
+      }
+      const calls = args?.calls as Array<{ tool_name?: unknown; arguments?: unknown }> | undefined;
+      if (!Array.isArray(calls) || calls.length === 0) {
+        return { content: [{ type: "text", text: "calls must be a non-empty array of {tool_name, arguments} objects." }], isError: true };
+      }
+      for (const call of calls) {
+        if (typeof call.tool_name !== "string" || !call.tool_name.trim()) {
+          return { content: [{ type: "text", text: "Each call must have a non-empty tool_name string." }], isError: true };
+        }
+      }
+      // Run all tools in parallel
+      const results = await Promise.all(
+        calls.map(async (call) => {
+          const toolName = call.tool_name as string;
+          const toolArgs = (call.arguments ?? {}) as Record<string, unknown>;
+          try {
+            const result = await routerClient!.callTool({ name: toolName, arguments: toolArgs });
+            return { tool_name: toolName, success: true, result };
+          } catch (e) {
+            return { tool_name: toolName, success: false, error: String(e) };
+          }
+        })
+      );
+      return {
+        content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+      };
     }
 
     if (name === "refresh_tools") {
