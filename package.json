@@ -1,0 +1,22 @@
+{
+  "name": "mcp-vector-proxy",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "setup": "node -e \"const p=process.platform;const {execSync}=require('child_process');if(p==='win32'){execSync('powershell -ExecutionPolicy Bypass -File setup.ps1',{stdio:'inherit'})}else{execSync('bash setup.sh',{stdio:'inherit'})}\"",
+    "update": "npm run build && node -e \"const p=process.platform;const {execSync}=require('child_process');if(p==='win32'){execSync('powershell -ExecutionPolicy Bypass -File restart-tray.ps1',{stdio:'inherit'})}else{execSync('bash restart-tray.sh',{stdio:'inherit'})}\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@xenova/transformers": "^2.17.2",
+    "express": "^5.2.1",
+    "systray2": "^2.1.4"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

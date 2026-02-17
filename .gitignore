@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.tool-index.json
+.tool-index.json.tmp
+.model-cache/
+.env
+config.json

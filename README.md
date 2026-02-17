@@ -1,0 +1,190 @@
+# MCP Vector Proxy
+
+A semantic MCP proxy that sits between AI agents and [MCP Router](https://mcprouter.com), exposing only 3 tools instead of hundreds. Uses local vector embeddings to find the right tool on demand — no OpenAI key required.
+
+## Why
+
+When you have 150+ MCP tools, passing all of them to an AI agent costs ~30,000 tokens per request. This proxy exposes just 3 tools (`discover_tools`, `execute_tool`, `refresh_tools`). The agent searches semantically for what it needs, then calls it — reducing token usage by ~93%.
+
+```
+Without proxy:  151 tools × ~200 tokens = 30,860 tokens per request
+With proxy:     3 tool definitions + search results = ~500 tokens
+```
+
+## Architecture
+
+```
+MCP Router (all your servers)
+        │ stdio
+        ▼
+mcp-vector-proxy  (tray-managed background process, port 3456)
+  - Local embeddings: all-MiniLM-L6-v2 (~25MB, runs offline)
+  - Vector index of all tools (cosine similarity search)
+  - Auto-syncs when tools change (MCP notifications + polling)
+  - HTTP: Streamable HTTP + SSE legacy
+        │
+        ├── Claude Code / other agents  (HTTP → :3456/mcp)
+        │
+        └── Claude Desktop              (stdio-bridge → HTTP)
+
+System tray  (node dist/tray.js, auto-starts on login)
+  - Green  = connected, N tools indexed
+  - Yellow = MCP Router reconnecting
+  - Red    = proxy down / crashed (auto-restarts)
+  - Right-click → Restart Proxy / Open Health URL / Exit
+```
+
+## Requirements
+
+- **All platforms:** Node.js 18+, [MCP Router](https://mcprouter.com) installed and running
+- **Windows:** Windows 10/11
+- **macOS:** macOS 10.15+
+- **Linux:** Any desktop with a system tray (GNOME, KDE, etc.)
+
+## Setup
+
+### 1. Configure your token
+
+```bash
+cp .env.example .env
+# Edit .env and replace "your-mcp-router-token-here" with your real MCPR_TOKEN
+```
+
+The `.env` file is gitignored. Alternatively, set `MCPR_TOKEN` as a system environment variable — it takes precedence over the `.env` file.
+
+### 2. Install dependencies and build
+
+```bash
+npm install
+npm run build
+```
+
+### 3. Register auto-start and launch the tray
+
+**Windows:**
+```powershell
+npm run setup
+# or: powershell -ExecutionPolicy Bypass -File setup.ps1
+```
+
+**macOS / Linux:**
+```bash
+npm run setup
+# or: bash setup.sh
+```
+
+This registers the tray to start on every login and launches it immediately.
+
+### 4. Connect your AI clients
+
+**Claude Code** (`~/.claude.json`):
+```json
+{
+  "mcpServers": {
+    "mcp-vector-proxy": {
+      "type": "http",
+      "url": "http://127.0.0.1:3456/mcp"
+    }
+  }
+}
+```
+
+**Claude Desktop** (`%APPDATA%\Claude\claude_desktop_config.json` on Windows, `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+```json
+{
+  "mcpServers": {
+    "mcp-vector-proxy": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-proxy/dist/stdio-bridge.js"],
+      "env": { "PROXY_URL": "http://127.0.0.1:3456/mcp" }
+    }
+  }
+}
+```
+
+**Any other agent** — point it at `http://127.0.0.1:3456/mcp` (Streamable HTTP) or `http://127.0.0.1:3456/sse` (SSE legacy).
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MCPR_TOKEN` | *(from .env)* | MCP Router auth token — required |
+| `HTTP_PORT` | *(none = stdio mode)* | Port for HTTP server |
+| `HTTP_HOST` | `127.0.0.1` | Bind address |
+| `POLL_INTERVAL_MS` | `15000` | Tool change polling interval |
+| `DISCOVER_LIMIT` | `10` | Default max results from `discover_tools` |
+
+## Tools Exposed to Agents
+
+| Tool | Description |
+|---|---|
+| `discover_tools` | Semantic search — find relevant tools by natural language query |
+| `execute_tool` | Execute any MCP tool by exact name with arguments |
+| `refresh_tools` | Force re-index all tools from MCP Router immediately |
+
+## npm Scripts
+
+```bash
+npm run build          # Compile TypeScript → dist/
+npm run setup          # Register auto-start + launch tray (platform-detected)
+npm run update         # Build + restart tray (platform-detected)
+```
+
+## Updating
+
+After changing source code:
+
+```bash
+npm run update
+```
+
+This rebuilds everything and restarts the tray (which restarts the proxy).
+
+## Health Check
+
+```
+GET http://127.0.0.1:3456/health
+```
+
+```json
+{
+  "status": "ok",
+  "routerConnected": true,
+  "tools": 151,
+  "indexedAt": "2026-02-17T15:51:21.620Z",
+  "sessions": { "streamable": 1, "sse": 0 }
+}
+```
+
+Status is `"ok"` when MCP Router is connected and tools are indexed. `"disconnected"` means the proxy is up but MCP Router is unreachable (it will auto-reconnect).
+
+## File Reference
+
+```
+src/
+  index.ts          — Main proxy server (HTTP + stdio modes, vector search)
+  stdio-bridge.ts   — Thin stdio→HTTP forwarder for Claude Desktop
+  launch-router.ts  — Spawns MCP Router CLI with windowsHide:true
+  tray.ts           — Cross-platform system tray (systray2)
+
+dist/               — Compiled output (generated by npm run build)
+
+.env.example        — Template for .env (copy and fill in MCPR_TOKEN)
+.env                — Your config (gitignored, never commit this)
+
+setup.ps1           — Windows: register auto-start + launch tray
+setup.sh            — macOS/Linux: register auto-start + launch tray
+restart-tray.ps1    — Windows: kill + restart tray
+restart-tray.sh     — macOS/Linux: kill + restart tray
+
+.tool-index.json    — Cached vector embeddings (auto-generated, gitignored)
+.model-cache/       — Downloaded embedding model (~25MB, gitignored)
+```
+
+## How Tool Sync Works
+
+1. On startup, all tools from MCP Router are embedded and cached to `.tool-index.json`
+2. MCP Router sends a `tools/list_changed` notification when servers change → immediate re-index
+3. A polling fallback runs every 15s to catch any missed notifications
+4. Re-indexing is incremental — only new or changed tools get re-embedded, cached embeddings are reused
+5. Tool schema changes (new parameters) are detected via fingerprint and trigger re-indexing
