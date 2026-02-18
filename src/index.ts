@@ -58,13 +58,22 @@ const HTTP_HOST        = process.env.HTTP_HOST ?? "127.0.0.1";
 
 env.cacheDir = MODEL_CACHE;
 
+// ─── In-memory cosine similarity ─────────────────────────────────────────────
+// Vectors are L2-normalized by the pipeline, so cosine = dot product.
+// For ≤10K tools this is <1ms — no vector DB needed for the hot path.
+function cosine(a: number[], b: number[]): number {
+  let dot = 0;
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  return dot;
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface ToolEntry {
   name: string;
   description: string;
   inputSchema: unknown;
-  // embeddings live in LanceDB, not in memory
+  vector: number[]; // kept in memory for sub-millisecond cosine scan
 }
 
 interface ToolIndex {
@@ -178,6 +187,7 @@ async function initLanceDb(): Promise<void> {
         name:        r.name        as string,
         description: r.description as string,
         inputSchema: JSON.parse((r.inputSchema as string) ?? "{}"),
+        vector:      Array.from(r.vector as number[]),
       })),
       indexedAt:   meta.indexedAt,
       fingerprint: meta.fingerprint,
@@ -315,14 +325,9 @@ async function buildIndex(reason = "startup"): Promise<{ added: number; removed:
     for (const tool of liveTools) {
       const desc = tool.description ?? "";
       const cacheKey = `${tool.name}|||${desc}`;
-      records.push({
-        name:        tool.name,
-        description: desc,
-        inputSchema: JSON.stringify(tool.inputSchema ?? {}),
-        cacheKey,
-        vector:      embeddingCache[cacheKey],
-      });
-      entries.push({ name: tool.name, description: desc, inputSchema: tool.inputSchema });
+      const vector = embeddingCache[cacheKey];
+      records.push({ name: tool.name, description: desc, inputSchema: JSON.stringify(tool.inputSchema ?? {}), cacheKey, vector });
+      entries.push({ name: tool.name, description: desc, inputSchema: tool.inputSchema, vector });
     }
 
     // Overwrite LanceDB table atomically
@@ -460,10 +465,12 @@ function createMCPServer(): Server {
       }
       const limit = (args?.limit as number) ?? DISCOVER_LIMIT;
 
-      // 1. Dense vector search via LanceDB
+      // 1. Dense vector search — in-memory cosine scan (<1ms for ≤10K tools)
       const queryEmbedding = await embed(query);
-      const vectorHits: Array<{ name: string; description: string; inputSchema: string; _distance: number }> =
-        await toolTable.vectorSearch(queryEmbedding).limit(limit * 3).toArray();
+      const vectorHits = toolIndex.tools
+        .map(t => ({ name: t.name, score: cosine(queryEmbedding, t.vector) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit * 3);
 
       // 2. BM25 keyword search over in-memory tool list
       const queryTerms = query.toLowerCase().match(/\w+/g) ?? [];
@@ -477,26 +484,24 @@ function createMCPServer(): Server {
         .sort((a, b) => b.score - a.score)
         .slice(0, limit * 3);
 
-      // 3. Reciprocal Rank Fusion
+      // 3. Reciprocal Rank Fusion (vector ranking already sorted by score desc)
       const fusedNames = rrfFuse(
         [vectorHits.map(r => r.name), bm25Hits.map(r => r.name)],
         limit
       );
 
-      // 4. Build results — relevance from vector distance (1 - L2²/2 for normalized vecs)
-      const distMap  = new Map(vectorHits.map(r => [r.name, r._distance]));
+      // 4. Build results — relevance is cosine similarity (0–1, already normalized)
+      const scoreMap = new Map(vectorHits.map(r => [r.name, r.score]));
       const toolMap  = new Map(toolIndex.tools.map(t => [t.name, t]));
 
       const results = fusedNames
         .map(n => {
           const tool = toolMap.get(n);
           if (!tool) return null;
-          const dist  = distMap.get(n) ?? 2;
-          const score = Math.max(0, 1 - dist / 2); // normalized-vector L2 → cosine
           return {
             name:        tool.name,
             description: tool.description,
-            relevance:   parseFloat(score.toFixed(4)),
+            relevance:   parseFloat((scoreMap.get(n) ?? 0).toFixed(4)),
             inputSchema: tool.inputSchema,
           };
         })
@@ -641,10 +646,10 @@ async function main() {
   // Init LanceDB first — loads cached embeddings so proxy can serve immediately
   await initLanceDb();
 
-  log("Loading embedding model (EmbeddingGemma-300M q8, downloads ~150MB on first run)...");
+  log("Loading embedding model (all-MiniLM-L6-v2, ~23MB)...");
   embedder = await pipeline(
     "feature-extraction",
-    "onnx-community/embeddinggemma-300m-ONNX",
+    "Xenova/all-MiniLM-L6-v2",
     { dtype: "q8", device: "cpu" }
   );
   log("Model ready.");
