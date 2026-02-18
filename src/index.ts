@@ -646,10 +646,10 @@ async function main() {
   // Init LanceDB first — loads cached embeddings so proxy can serve immediately
   await initLanceDb();
 
-  log("Loading embedding model (all-MiniLM-L6-v2, ~23MB)...");
+  log("Loading embedding model (mxbai-embed-xsmall-v1, ~23MB)...");
   embedder = await pipeline(
     "feature-extraction",
-    "Xenova/all-MiniLM-L6-v2",
+    "mixedbread-ai/mxbai-embed-xsmall-v1",
     { dtype: "q8", device: "cpu" }
   );
   log("Model ready.");
