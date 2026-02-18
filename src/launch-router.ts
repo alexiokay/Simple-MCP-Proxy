@@ -6,13 +6,14 @@ import { spawn } from "child_process";
 
 const isWindows = process.platform === "win32";
 
-// Use shell:false to avoid shell injection via env vars.
-// On Windows, npx is a .cmd file and needs the explicit .cmd extension without a shell.
-const npxCmd = isWindows ? "npx.cmd" : "npx";
+// On Windows, npx is a .cmd batch file which requires cmd.exe to run.
+// shell:true is safe here because all arguments are hardcoded constants.
+// On Unix, shell:false is fine and avoids any shell overhead.
+const npxCmd = isWindows ? "npx" : "npx";
 
 const proc = spawn(npxCmd, ["--yes", "@mcp_router/cli@latest", "connect"], {
   stdio: "inherit",
-  shell: false,
+  shell: isWindows,
   windowsHide: true,
 });
 
