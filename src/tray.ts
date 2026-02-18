@@ -6,7 +6,10 @@
  * Start: node dist/tray.js
  * Auto-start: run setup.ps1 (Windows) or setup.sh (macOS/Linux)
  */
-import SysTray from "systray2";
+import _SysTray from "systray2";
+// systray2 is CJS (exports.default = class). In ESM, default import = whole exports object.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const SysTray = ((_SysTray as any).default ?? _SysTray) as typeof _SysTray;
 import { spawn, ChildProcess } from "child_process";
 import { deflateSync } from "zlib";
 import { readFileSync } from "fs";
@@ -239,7 +242,9 @@ async function poll(): Promise<void> {
 
 // Assign (not declare) — declared at top of module to avoid TDZ in onClick closure
 pollTimer = setInterval(poll, 5000);
-tray.onReady(() => poll());
+// onReady() requires _rl to be set (which happens async inside init()).
+// Use tray.ready() instead so we wait for the binary to fully start.
+tray.ready().then(() => poll());
 
 // Suppress unused variable warning for SEQ_STATUS (reserved for future use)
 void SEQ_STATUS;
