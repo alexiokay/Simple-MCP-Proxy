@@ -5,6 +5,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "make-exe": "powershell -ExecutionPolicy Bypass -File make-exe.ps1",
     "setup": "node -e \"const p=process.platform;const {execSync}=require('child_process');if(p==='win32'){execSync('powershell -ExecutionPolicy Bypass -File setup.ps1',{stdio:'inherit'})}else{execSync('bash setup.sh',{stdio:'inherit'})}\"",
     "update": "npm run build && node -e \"const p=process.platform;const {execSync}=require('child_process');if(p==='win32'){execSync('powershell -ExecutionPolicy Bypass -File restart-tray.ps1',{stdio:'inherit'})}else{execSync('bash restart-tray.sh',{stdio:'inherit'})}\""
   },

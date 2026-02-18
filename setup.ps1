@@ -39,5 +39,12 @@ if ($pinned) {
     Write-Host "Tip: click the ^ in your taskbar, find MCP Proxy, right-click -> 'Always show'." -ForegroundColor Yellow
 }
 
+# 5. Compile MCP-Proxy.exe launcher
+$makeExe = Join-Path $scriptDir "make-exe.ps1"
+if (Test-Path $makeExe) {
+    & $makeExe
+}
+
 Write-Host ""
 Write-Host "Done! The tray will auto-start on every login." -ForegroundColor Cyan
+Write-Host "You can also double-click MCP-Proxy.exe to start it manually." -ForegroundColor Cyan

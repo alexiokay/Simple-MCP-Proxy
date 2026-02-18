@@ -1,5 +1,6 @@
 node_modules/
 dist/
+MCP-Proxy.exe
 .tool-index.json
 .tool-index.json.tmp
 .model-cache/
