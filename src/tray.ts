@@ -10,7 +10,7 @@ import _SysTray from "systray2";
 // systray2 is CJS (exports.default = class). In ESM, default import = whole exports object.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const SysTray = ((_SysTray as any).default ?? _SysTray) as typeof _SysTray;
-import { spawn, ChildProcess } from "child_process";
+import { spawn, execFileSync, ChildProcess } from "child_process";
 import { deflateSync } from "zlib";
 import { readFileSync } from "fs";
 import path from "path";
@@ -112,9 +112,14 @@ let proxyProc: ChildProcess | null = null;
 // Declare at module top so the onClick closure can reference it safely (no TDZ risk)
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-// Proxy inherits the full environment — .env is already loaded into process.env above.
-// index.ts has its own defaults for each variable (HTTP_PORT, POLL_INTERVAL_MS, etc).
-const ENV: NodeJS.ProcessEnv = { ...process.env };
+// Proxy inherits environment. Tray always runs the proxy in HTTP mode,
+// so inject HTTP_PORT/HTTP_HOST defaults here if the user hasn't set them.
+// process.env already has .env values loaded above, so user values win.
+const ENV: NodeJS.ProcessEnv = {
+  HTTP_PORT: HTTP_PORT,
+  HTTP_HOST: HTTP_HOST,
+  ...process.env,
+};
 
 function startProxy(): void {
   proxyProc = spawn("node", [SCRIPT], {
@@ -133,7 +138,8 @@ function killProxy(): void {
   try {
     if (proxyProc.exitCode === null) {
       if (IS_WIN) {
-        spawn("taskkill", ["/F", "/T", "/PID", String(pid)],
+        // execFileSync so the kill completes before we proceed (prevents orphans)
+        execFileSync("taskkill", ["/F", "/T", "/PID", String(pid)],
           { stdio: "ignore" });
       } else {
         try { process.kill(-pid, "SIGKILL"); }
