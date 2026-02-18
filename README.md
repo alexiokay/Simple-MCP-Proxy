@@ -1,14 +1,14 @@
 # MCP Vector Proxy
 
-A semantic MCP proxy that sits between AI agents and [MCP Router](https://mcprouter.com), exposing only 3 tools instead of hundreds. Uses local vector embeddings to find the right tool on demand — no OpenAI key required.
+A semantic MCP proxy that sits between AI agents and [MCP Router](https://mcprouter.com), exposing only 4 tools instead of hundreds. Uses local vector embeddings to find the right tool on demand — no OpenAI key required.
 
 ## Why
 
-When you have 150+ MCP tools, passing all of them to an AI agent costs ~30,000 tokens per request. This proxy exposes just 3 tools (`discover_tools`, `execute_tool`, `refresh_tools`). The agent searches semantically for what it needs, then calls it — reducing token usage by ~93%.
+When you have 150+ MCP tools, passing all of them to an AI agent costs ~30,000 tokens per request. This proxy exposes just 4 tools (`discover_tools`, `execute_tool`, `batch_execute`, `refresh_tools`). The agent searches semantically for what it needs, then calls it — reducing token usage by ~93%.
 
 ```
 Without proxy:  151 tools × ~200 tokens = 30,860 tokens per request
-With proxy:     3 tool definitions + search results = ~500 tokens
+With proxy:     4 tool definitions + search results = ~500 tokens
 ```
 
 ## Architecture
@@ -18,8 +18,9 @@ MCP Router (all your servers)
         │ stdio
         ▼
 mcp-vector-proxy  (tray-managed background process, port 3456)
-  - Local embeddings: all-MiniLM-L6-v2 (~25MB, runs offline)
-  - Vector index of all tools (cosine similarity search)
+  - Local embeddings: EmbeddingGemma-300M q8 (~150MB, runs offline)
+  - LanceDB vector store (persistent, handles 1M+ tools, no server)
+  - Hybrid search: dense vector + BM25 keyword + RRF fusion
   - Auto-syncs when tools change (MCP notifications + polling)
   - HTTP: Streamable HTTP + SSE legacy
         │
@@ -40,6 +41,8 @@ System tray  (node dist/tray.js, auto-starts on login)
 - **Windows:** Windows 10/11
 - **macOS:** macOS 10.15+
 - **Linux:** Any desktop with a system tray (GNOME, KDE, etc.)
+
+> **First run:** EmbeddingGemma-300M (~150MB) downloads automatically on first startup and is cached to `.model-cache/`. Subsequent starts are instant.
 
 ## Setup
 
@@ -118,8 +121,9 @@ This registers the tray to start on every login and launches it immediately.
 
 | Tool | Description |
 |---|---|
-| `discover_tools` | Semantic search — find relevant tools by natural language query |
+| `discover_tools` | Hybrid semantic + keyword search — find relevant tools by natural language query |
 | `execute_tool` | Execute any MCP tool by exact name with arguments |
+| `batch_execute` | Execute multiple MCP tools in parallel in a single call |
 | `refresh_tools` | Force re-index all tools from MCP Router immediately |
 
 ## npm Scripts
@@ -162,7 +166,7 @@ Status is `"ok"` when MCP Router is connected and tools are indexed. `"disconnec
 
 ```
 src/
-  index.ts          — Main proxy server (HTTP + stdio modes, vector search)
+  index.ts          — Main proxy server (HTTP + stdio modes, hybrid vector search)
   stdio-bridge.ts   — Thin stdio→HTTP forwarder for Claude Desktop
   launch-router.ts  — Spawns MCP Router CLI with windowsHide:true
   tray.ts           — Cross-platform system tray (systray2)
@@ -177,14 +181,25 @@ setup.sh            — macOS/Linux: register auto-start + launch tray
 restart-tray.ps1    — Windows: kill + restart tray
 restart-tray.sh     — macOS/Linux: kill + restart tray
 
-.tool-index.json    — Cached vector embeddings (auto-generated, gitignored)
-.model-cache/       — Downloaded embedding model (~25MB, gitignored)
+.lancedb/           — LanceDB vector store (auto-generated, gitignored)
+.tool-meta.json     — Tool fingerprint cache (auto-generated, gitignored)
+.model-cache/       — Downloaded embedding model (~150MB, gitignored)
 ```
 
 ## How Tool Sync Works
 
-1. On startup, all tools from MCP Router are embedded and cached to `.tool-index.json`
+1. On startup, tools from MCP Router are embedded using EmbeddingGemma-300M and stored in LanceDB
 2. MCP Router sends a `tools/list_changed` notification when servers change → immediate re-index
 3. A polling fallback runs every 15s to catch any missed notifications
 4. Re-indexing is incremental — only new or changed tools get re-embedded, cached embeddings are reused
 5. Tool schema changes (new parameters) are detected via fingerprint and trigger re-indexing
+
+## How Search Works
+
+`discover_tools` uses **hybrid search** for best accuracy:
+
+1. **Dense vector search** — LanceDB finds semantically similar tools using EmbeddingGemma-300M embeddings (handles paraphrasing, synonyms, conceptual matches)
+2. **BM25 keyword search** — in-memory scoring finds exact tool name / keyword matches that semantic search can miss
+3. **RRF fusion** — Reciprocal Rank Fusion merges both ranked lists into a single optimal ranking
+
+This combination handles both vague queries ("something to do with files") and precise queries ("browser_screenshot") accurately at any scale.

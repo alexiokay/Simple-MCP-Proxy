@@ -3,5 +3,7 @@ dist/
 .tool-index.json
 .tool-index.json.tmp
 .model-cache/
+.lancedb/
+.tool-meta.json
 .env
 config.json
