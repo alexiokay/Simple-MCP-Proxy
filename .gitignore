@@ -8,3 +8,5 @@ MCP-Proxy.exe
 .tool-meta.json
 .env
 config.json
+.node-path
+improvements hmm.txt

@@ -11,14 +11,14 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^3.8.1",
-    "@lancedb/lancedb": "^0.26.2",
+    "@lancedb/lancedb": "0.26.2",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "express": "^5.2.1",
     "systray2": "^2.1.4"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
-    "@types/node": "^20.0.0",
-    "typescript": "^5.4.0"
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
   }
 }

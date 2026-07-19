@@ -12,37 +12,70 @@ import _SysTray from "systray2";
 const SysTray = ((_SysTray as any).default ?? _SysTray) as typeof _SysTray;
 import { spawn, execFileSync, ChildProcess } from "child_process";
 import { deflateSync } from "zlib";
-import { readFileSync } from "fs";
+import { readFileSync, mkdirSync, createWriteStream, WriteStream } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { homedir } from "os";
+
+// Importing config.ts runs its top-level .env loader as a side effect, so
+// process.env is populated before we read HTTP_PORT/HTTP_HOST below.
+// Single source of truth for env parsing and the default port.
+import { HTTP_PORT as CONFIG_PORT, HTTP_HOST, DEFAULT_HTTP_PORT } from "./config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SCRIPT     = path.join(__dirname, "index.js");
-const IS_WIN     = process.platform === "win32";
-const IS_MAC     = process.platform === "darwin";
+const SCRIPT = path.join(__dirname, "index.js");
+const IS_WIN = process.platform === "win32";
+const IS_MAC = process.platform === "darwin";
 
-// Load .env file from project root into process.env.
-// Values already in process.env take precedence (env vars > .env file).
-function loadDotEnv(): void {
+// Tray always runs the proxy in HTTP mode — fall back to DEFAULT_HTTP_PORT
+// when the user hasn't set one. CONFIG_PORT is null in that case (stdio mode),
+// which doesn't apply to the tray-launched proxy.
+const HTTP_PORT = String(CONFIG_PORT ?? DEFAULT_HTTP_PORT);
+const HEALTH = `http://${HTTP_HOST}:${HTTP_PORT}/health`;
+const DASHBOARD = `http://${HTTP_HOST}:${HTTP_PORT}/`;
+
+// ── Absolute node path ────────────────────────────────────────────────────────
+// Cold-boot processes (Run key / Task Scheduler) inherit a stripped PATH that
+// often doesn't include nvm/volta/fnm shims. setup.ps1 bakes the absolute node
+// path to .node-path; we use it for spawning the proxy and prepend its dir to
+// PATH so launch-router.ts can still find npx.
+function resolveNodeBinary(): { bin: string; dir: string } {
+  const fallback = { bin: "node", dir: "" };
   try {
-    const lines = readFileSync(path.join(__dirname, "../.env"), "utf-8").split(/\r?\n/);
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eq = trimmed.indexOf("=");
-      if (eq === -1) continue;
-      const key = trimmed.slice(0, eq).trim();
-      const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
-      if (key && !(key in process.env)) process.env[key] = val;
+    const baked = readFileSync(path.join(__dirname, "../.node-path"), "utf-8").trim();
+    if (baked) {
+      return { bin: baked, dir: path.dirname(baked) };
     }
-  } catch { /* no .env file — rely on process.env */ }
+  } catch { /* no .node-path file — rely on PATH */ }
+  return fallback;
 }
-loadDotEnv();
+const NODE_BIN = resolveNodeBinary();
+if (NODE_BIN.dir) {
+  // Prepend so child spawn("node", ...) and spawn("npx", ...) both resolve.
+  const sep = IS_WIN ? ";" : ":";
+  process.env.PATH = `${NODE_BIN.dir}${sep}${process.env.PATH ?? ""}`;
+}
 
-// Read after .env is loaded
-const HTTP_PORT = process.env.HTTP_PORT ?? "3456";
-const HTTP_HOST = process.env.HTTP_HOST ?? "127.0.0.1";
-const HEALTH    = `http://${HTTP_HOST}:${HTTP_PORT}/health`;
+// ── Proxy log file ────────────────────────────────────────────────────────────
+// Tray pipes proxy child stdout/stderr here so boot failures can be diagnosed.
+// Located at ~/.mcp-proxy/proxy.log (rotated manually; capped below in code).
+const LOG_DIR = path.join(homedir(), ".mcp-proxy");
+const LOG_FILE = path.join(LOG_DIR, "proxy.log");
+mkdirSync(LOG_DIR, { recursive: true });
+
+function openLog(): WriteStream {
+  try {
+    return createWriteStream(LOG_FILE, { flags: "a" });
+  } catch {
+    // If we can't open the log (permissions, etc.), fall back to /dev/null sink.
+    return createWriteStream(IS_WIN ? "\\\\.\\NUL" : "/dev/null", { flags: "a" });
+  }
+}
+
+function logToBoth(stream: WriteStream, msg: string): void {
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  stream.write(line);
+}
 
 // ── PNG / ICO icon generation (zero deps, pure Node.js) ───────────────────────
 
@@ -90,7 +123,7 @@ function makeIco(r: number, g: number, b: number): Buffer {
   hdr.writeUInt16LE(0, 0); hdr.writeUInt16LE(1, 2); hdr.writeUInt16LE(1, 4);
   const dir = Buffer.alloc(16);
   dir[0] = 16; dir[1] = 16;          // width, height
-  dir.writeUInt16LE(0,  4);           // planes
+  dir.writeUInt16LE(0, 4);           // planes
   dir.writeUInt16LE(32, 6);           // bit depth
   dir.writeUInt32LE(png.length, 8);   // size of PNG
   dir.writeUInt32LE(22, 12);          // offset (6 hdr + 16 dir)
@@ -101,9 +134,9 @@ function icon(r: number, g: number, b: number): string {
   return (IS_WIN ? makeIco(r, g, b) : makePng(r, g, b)).toString("base64");
 }
 
-const ICON_GREEN  = icon(34,  197, 94);   // #22c55e
+const ICON_GREEN = icon(34, 197, 94);   // #22c55e
 const ICON_YELLOW = icon(234, 179, 8);    // #eab308
-const ICON_RED    = icon(239, 68,  68);   // #ef4444
+const ICON_RED = icon(239, 68, 68);   // #ef4444
 
 // ── Proxy process management ───────────────────────────────────────────────────
 
@@ -122,11 +155,20 @@ const ENV: NodeJS.ProcessEnv = {
 };
 
 function startProxy(): void {
-  proxyProc = spawn("node", [SCRIPT], {
+  const logStream = openLog();
+  logToBoth(logStream, `── proxy starting (pid pending) ──`);
+  proxyProc = spawn(NODE_BIN.bin, [SCRIPT], {
     env: ENV,
-    stdio: "ignore",
+    stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
     detached: false,
+  });
+  const writeOut = (buf: Buffer) => logStream.write(buf);
+  proxyProc.stdout?.on("data", writeOut);
+  proxyProc.stderr?.on("data", writeOut);
+  proxyProc.on("exit", (code, signal) => {
+    logToBoth(logStream, `── proxy exited (code=${code} signal=${signal}) ──`);
+    logStream.end();
   });
 }
 
@@ -155,30 +197,41 @@ function openUrl(url: string): void {
   spawn(cmd, [url], { shell: IS_WIN, stdio: "ignore", detached: true }).unref();
 }
 
-// ── Menu ─────────────────────────────────────────────────────────────────────
+function openLogFile(): void {
+  // Open the proxy log in the OS default editor for .log files.
+  if (IS_WIN) {
+    spawn("cmd", ["/c", "start", "", LOG_FILE], { shell: true, stdio: "ignore", detached: true }).unref();
+  } else {
+    openUrl(LOG_FILE);
+  }
+}
 
-const SEQ_STATUS  = 0;
-const SEQ_HEALTH  = 2;
-const SEQ_RESTART = 3;
-const SEQ_EXIT    = 5;
+// ── Menu ─────────────────────────────────────────────────────────────────────
+// Item positions: 0=status, 1=separator, 2=dashboard, 3=log, 4=restart, 5=separator, 6=exit
+const SEQ_STATUS = 0;
+const SEQ_DASHBOARD = 2;
+const SEQ_LOG = 3;
+const SEQ_RESTART = 4;
+const SEQ_EXIT = 6;
 
 startProxy();
 
 const tray = new SysTray({
   menu: {
-    icon:    ICON_YELLOW,
-    title:   "",
+    icon: ICON_YELLOW,
+    title: "",
     tooltip: "MCP Proxy - starting...",
     items: [
-      { title: "Starting...",      tooltip: "", checked: false, enabled: false },
+      { title: "Starting...", tooltip: "", checked: false, enabled: false },
       SysTray.separator,
-      { title: "Open Health URL",  tooltip: "", checked: false, enabled: true  },
-      { title: "Restart Proxy",    tooltip: "", checked: false, enabled: true  },
+      { title: "Open Dashboard", tooltip: "", checked: false, enabled: true },
+      { title: "Open Log File", tooltip: "", checked: false, enabled: true },
+      { title: "Restart Proxy", tooltip: "", checked: false, enabled: true },
       SysTray.separator,
-      { title: "Exit",             tooltip: "", checked: false, enabled: true  },
+      { title: "Exit", tooltip: "", checked: false, enabled: true },
     ],
   },
-  debug:   false,
+  debug: false,
   copyDir: true,
 });
 
@@ -186,8 +239,12 @@ const tray = new SysTray({
 
 tray.onClick(action => {
   switch (action.seq_id) {
-    case SEQ_HEALTH:
-      openUrl(HEALTH);
+    case SEQ_DASHBOARD:
+      openUrl(DASHBOARD);
+      break;
+
+    case SEQ_LOG:
+      openLogFile();
       break;
 
     case SEQ_RESTART:
@@ -197,27 +254,41 @@ tray.onClick(action => {
       break;
 
     case SEQ_EXIT:
-      if (pollTimer) clearInterval(pollTimer);
-      killProxy();
-      tray.kill();
-      process.exit(0);
+      exitCleanly();
   }
 });
+
+/** Centralized exit: stop polling, kill proxy tree, kill tray, then exit. */
+function exitCleanly(): void {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  killProxy();
+  try { tray.kill(); } catch { /* tray already dead */ }
+  // Small delay so taskkill /T completes before we vanish
+  setTimeout(() => process.exit(0), 500);
+}
+
+// Ensure cleanup if the tray process is killed externally (e.g. Task Manager)
+process.on("SIGTERM", exitCleanly);
+process.on("SIGINT", exitCleanly);
+process.on("exit", () => { killProxy(); });
 
 // ── Status updates ────────────────────────────────────────────────────────────
 
 function updateTray(ico: string, status: string, tooltip: string): void {
-  tray.sendAction({ type: "update-menu", menu: {
-    icon: ico, title: "", tooltip,
-    items: [
-      { title: status,            tooltip: "", checked: false, enabled: false },
-      SysTray.separator,
-      { title: "Open Health URL", tooltip: "", checked: false, enabled: true  },
-      { title: "Restart Proxy",   tooltip: "", checked: false, enabled: true  },
-      SysTray.separator,
-      { title: "Exit",            tooltip: "", checked: false, enabled: true  },
-    ],
-  }});
+  tray.sendAction({
+    type: "update-menu", menu: {
+      icon: ico, title: "", tooltip,
+      items: [
+        { title: status, tooltip: "", checked: false, enabled: false },
+        SysTray.separator,
+        { title: "Open Dashboard", tooltip: "", checked: false, enabled: true },
+        { title: "Open Log File", tooltip: "", checked: false, enabled: true },
+        { title: "Restart Proxy", tooltip: "", checked: false, enabled: true },
+        SysTray.separator,
+        { title: "Exit", tooltip: "", checked: false, enabled: true },
+      ],
+    }
+  });
 }
 
 // ── Health polling + crash detection ─────────────────────────────────────────
@@ -231,16 +302,26 @@ async function poll(): Promise<void> {
   }
 
   try {
-    const res  = await fetch(HEALTH);
-    const data = await res.json() as { status: string; tools: number };
-    if (data.status === "ok")
+    const res = await fetch(HEALTH);
+    const data = await res.json() as {
+      status: string;
+      tools: number;
+      indexedAt?: string | null;
+      lastError?: string | null;
+      lastErrorAt?: string | null;
+    };
+    const idx = data.indexedAt ? ` | idx ${new Date(data.indexedAt).toLocaleString()}` : "";
+    if (data.status === "ok") {
       updateTray(ICON_GREEN,
         `Connected - ${data.tools} tools`,
-        `MCP Proxy | ${data.tools} tools | OK`);
-    else
+        `MCP Proxy | ${data.tools} tools | OK${idx}`);
+    } else {
+      const errLine = data.lastError ? `\nLast error: ${data.lastError}` : "";
+      const errAt = data.lastErrorAt ? ` (${new Date(data.lastErrorAt).toLocaleString()})` : "";
       updateTray(ICON_YELLOW,
         `Router reconnecting (${data.tools} cached)`,
-        "MCP Proxy - Router reconnecting...");
+        `MCP Proxy - router reconnecting${idx}${errLine}${errAt}`);
+    }
   } catch {
     updateTray(ICON_RED, "Proxy starting up...", "MCP Proxy - starting...");
   }

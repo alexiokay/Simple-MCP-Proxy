@@ -1,6 +1,9 @@
-# make-exe.ps1 — Compile MCP-Proxy.exe using .NET built into Windows.
+# make-exe.ps1 - Compile MCP-Proxy.exe using .NET built into Windows.
 # No Go, no external tools. Just PowerShell + .NET (always available on Win 10/11).
 # Result: a double-clickable MCP-Proxy.exe that starts the tray silently.
+#
+# The compiled exe reads .node-path (written by setup.ps1) at runtime so it
+# keeps working after Node upgrades - no PATH dependency at double-click time.
 
 $scriptDir = $PSScriptRoot
 $outExe    = Join-Path $scriptDir "MCP-Proxy.exe"
@@ -26,8 +29,17 @@ class Launcher {
             return;
         }
 
+        // Prefer baked absolute path (survives PATH stripping at cold boot).
+        string nodePath = null;
+        string nodePathFile = Path.Combine(dir, ".node-path");
+        if (File.Exists(nodePathFile)) {
+            nodePath = File.ReadAllText(nodePathFile).Trim();
+            if (!File.Exists(nodePath)) nodePath = null;
+        }
+        if (nodePath == null) nodePath = "node"; // fall back to PATH
+
         Process.Start(new ProcessStartInfo {
-            FileName         = "node",
+            FileName         = nodePath,
             Arguments        = "\"" + js + "\"",
             WorkingDirectory = dir,
             UseShellExecute  = false,

@@ -1,581 +1,72 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+/**
+ * MCP Vector Proxy — entry point.
+ *
+ * Wires together the VectorIndex, RouterConnection, and MCP Server,
+ * then starts in either HTTP or stdio mode based on config.
+ */
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+// TODO(post-2026-07-28): MCP SDK v2 ships alongside the 2026-07-28 spec.
+// Verify createMcpExpressApp still exists in v2; if not, migrate to the
+// inline transport pattern the SDK then recommends.
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import {
-  ListToolsRequestSchema,
-  CallToolRequestSchema,
-  ToolListChangedNotificationSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-import { pipeline, env } from "@huggingface/transformers";
-import * as lancedb from "@lancedb/lancedb";
-import { readFileSync, writeFileSync, existsSync } from "fs";
-import { randomUUID } from "crypto";
 import express from "express";
-import path from "path";
-import { fileURLToPath } from "url";
+import { randomUUID } from "crypto";
 
-const __dirname  = path.dirname(fileURLToPath(import.meta.url));
-const LANCE_DIR  = path.join(__dirname, "../.lancedb");
-const META_FILE  = path.join(__dirname, "../.tool-meta.json");
-const MODEL_CACHE = path.join(__dirname, "../.model-cache");
+import { HTTP_PORT, HTTP_HOST, ALLOW_REMOTE, log } from "./config.js";
+import { VectorIndex } from "./vector-index.js";
+import { RouterConnection } from "./router-connection.js";
+import { ActivityLog } from "./activity.js";
+import { ToolStats } from "./stats.js";
+import { createMCPServer } from "./server.js";
+import { createDashboardRouter } from "./dashboard.js";
 
-// Load .env file from project root into process.env.
-// Values already in process.env take precedence (env vars > .env file).
-function loadDotEnv(): void {
-  try {
-    const lines = readFileSync(path.join(__dirname, "../.env"), "utf-8").split(/\r?\n/);
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eq = trimmed.indexOf("=");
-      if (eq === -1) continue;
-      const key = trimmed.slice(0, eq).trim();
-      const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
-      if (key && !(key in process.env)) process.env[key] = val;
-    }
-  } catch { /* no .env file — rely on process.env */ }
-}
-loadDotEnv();
+// ─── Singleton instances ──────────────────────────────────────────────────────
 
-const MCPR_TOKEN = process.env.MCPR_TOKEN ?? "";
-if (!MCPR_TOKEN) {
-  process.stderr.write(
-    "[mcp-vector-proxy] Fatal: MCPR_TOKEN not set.\n" +
-    "  Option 1: set the MCPR_TOKEN environment variable.\n" +
-    "  Option 2: add MCPR_TOKEN=your-token to a .env file in the project root.\n"
-  );
-  process.exit(1);
-}
+const vectorIndex = new VectorIndex();
+const router = new RouterConnection(vectorIndex);
+const activity = new ActivityLog(50);
+const stats = new ToolStats();
 
-const DISCOVER_LIMIT   = parseInt(process.env.DISCOVER_LIMIT   ?? "10");
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS ?? "15000");
-const HTTP_PORT        = process.env.HTTP_PORT ? parseInt(process.env.HTTP_PORT) : null;
-const HTTP_HOST        = process.env.HTTP_HOST ?? "127.0.0.1";
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
 
-env.cacheDir = MODEL_CACHE;
-
-// ─── In-memory cosine similarity ─────────────────────────────────────────────
-// Vectors are L2-normalized by the pipeline, so cosine = dot product.
-// For ≤10K tools this is <1ms — no vector DB needed for the hot path.
-function cosine(a: number[], b: number[]): number {
-  let dot = 0;
-  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-  return dot;
-}
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-interface ToolEntry {
-  name: string;
-  description: string;
-  inputSchema: unknown;
-  vector: number[]; // kept in memory for sub-millisecond cosine scan
-}
-
-interface ToolIndex {
-  tools: ToolEntry[];
-  indexedAt: string;
-  fingerprint: string;
-}
-
-// ─── Shared state ─────────────────────────────────────────────────────────────
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let embedder: any;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let lanceDb: any;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let toolTable: any = null;
-let routerClient: Client | null = null;
-let routerConnected = false;
-let toolIndex: ToolIndex = { tools: [], indexedAt: "", fingerprint: "" };
-let reindexing = false;
-let reconnecting = false;
-let pollTimer: ReturnType<typeof setInterval> | null = null;
-let routerTransport: StdioClientTransport | null = null;
-
-// Graceful shutdown
-process.on("SIGTERM", () => { shutdown(); });
-process.on("SIGINT",  () => { shutdown(); });
-
-function shutdown() {
+async function shutdown(): Promise<void> {
   log("Shutting down...");
-  if (pollTimer) clearInterval(pollTimer);
-  if (routerTransport) { try { routerTransport.close(); } catch { /* ignore */ } }
+  router.disconnect();
+  // Give the transport a beat to actually close before we exit so we don't
+  // orphan the router-cli child on Windows.
+  await new Promise((r) => setTimeout(r, 200));
   process.exit(0);
 }
 
-// ─── Utilities ────────────────────────────────────────────────────────────────
-
-function log(msg: string) {
-  process.stderr.write(`[mcp-vector-proxy] ${msg}\n`);
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// Includes inputSchema so schema changes trigger re-indexing
-function fingerprint(tools: Array<{ name: string; description?: string | null; inputSchema?: unknown }>): string {
-  return tools
-    .map((t) => `${t.name}|${t.description ?? ""}|${JSON.stringify(t.inputSchema ?? {})}`)
-    .sort()
-    .join("\n");
-}
-
-async function embed(text: string): Promise<number[]> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const out = await (embedder as any)(text, { pooling: "mean", normalize: true });
-  return Array.from(out.data as Float32Array);
-}
-
-// ─── Hybrid search helpers ────────────────────────────────────────────────────
-
-/**
- * BM25 keyword score for a single document.
- * No IDF (single-pass, in-memory — IDF would require two passes).
- * Still effective for short tool name+description text.
- */
-function bm25Score(queryTerms: string[], docText: string, avgDocLen: number): number {
-  const k1 = 1.5, b = 0.75;
-  const words = docText.toLowerCase().match(/\w+/g) ?? [];
-  const docLen = words.length;
-  if (docLen === 0) return 0;
-  const tf = new Map<string, number>();
-  for (const w of words) tf.set(w, (tf.get(w) ?? 0) + 1);
-  let score = 0;
-  for (const term of queryTerms) {
-    const freq = tf.get(term) ?? 0;
-    if (freq === 0) continue;
-    score += (freq * (k1 + 1)) / (freq + k1 * (1 - b + b * (docLen / avgDocLen)));
-  }
-  return score;
-}
-
-/**
- * Reciprocal Rank Fusion — merges multiple ranked lists into one.
- * k=60 is the standard constant from the original RRF paper.
- */
-function rrfFuse(rankedLists: string[][], topK: number, k = 60): string[] {
-  const scores = new Map<string, number>();
-  for (const list of rankedLists) {
-    list.forEach((name, rank) => {
-      scores.set(name, (scores.get(name) ?? 0) + 1 / (k + rank + 1));
-    });
-  }
-  return [...scores.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, topK)
-    .map(([name]) => name);
-}
-
-// ─── LanceDB setup ────────────────────────────────────────────────────────────
-
-async function initLanceDb(): Promise<void> {
-  lanceDb = await lancedb.connect(LANCE_DIR);
-  try {
-    toolTable = await lanceDb.openTable("tools");
-    const rows = await toolTable.toArray();
-    let meta = { fingerprint: "", indexedAt: "" };
-    if (existsSync(META_FILE)) {
-      try { meta = JSON.parse(readFileSync(META_FILE, "utf-8")); } catch { /* ignore */ }
-    }
-    toolIndex = {
-      tools: rows.map((r: any) => ({
-        name:        r.name        as string,
-        description: r.description as string,
-        inputSchema: JSON.parse((r.inputSchema as string) ?? "{}"),
-        vector:      Array.from(r.vector as number[]),
-      })),
-      indexedAt:   meta.indexedAt,
-      fingerprint: meta.fingerprint,
-    };
-    log(`Loaded ${rows.length} tools from LanceDB cache.`);
-  } catch {
-    log("No LanceDB cache — will build index on first MCP Router connection.");
-  }
-}
-
-// ─── MCP Router connection with auto-reconnect ────────────────────────────────
-
-async function connectToRouterWithRetry(): Promise<void> {
-  let attempt = 0;
-  while (true) {
-    try {
-      log(`Connecting to MCP Router${attempt > 0 ? ` (attempt ${attempt + 1})` : ""}...`);
-      const transport = new StdioClientTransport({
-        command: "node",
-        args: [path.join(__dirname, "launch-router.js")],
-        env: { ...(process.env as Record<string, string>), MCPR_TOKEN },
-      });
-      routerTransport = transport;
-
-      const client = new Client(
-        { name: "mcp-vector-proxy", version: "1.0.0" },
-        { capabilities: {} }
-      );
-
-      transport.onclose = () => {
-        routerConnected = false;
-        routerClient = null;
-        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-        if (reconnecting) return;
-        reconnecting = true;
-        log("MCP Router disconnected — reconnecting in 5s...");
-        sleep(5000).then(() =>
-          connectToRouterWithRetry().finally(() => { reconnecting = false; })
-        );
-      };
-
-      transport.onerror = (e) => log(`Transport error: ${e}`);
-
-      await client.connect(transport);
-      routerClient = client;
-      routerConnected = true;
-      attempt = 0;
-      log("MCP Router connected.");
-
-      client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
-        log("Notification: tools changed — re-indexing...");
-        await buildIndex("notification");
-      });
-
-      await buildIndex("startup");
-      startPolling();
-      return;
-
-    } catch (e) {
-      attempt++;
-      const delay = Math.min(2000 * Math.pow(2, attempt - 1), 30000);
-      log(`MCP Router unavailable: ${e}. Retrying in ${delay / 1000}s...`);
-      await sleep(delay);
-    }
-  }
-}
-
-// ─── Vector index (LanceDB) ───────────────────────────────────────────────────
-
-async function buildIndex(reason = "startup"): Promise<{ added: number; removed: number; unchanged: number }> {
-  if (!routerClient || !routerConnected) {
-    log("Skipping index build — MCP Router not connected.");
-    return { added: 0, removed: 0, unchanged: 0 };
-  }
-  if (reindexing) {
-    log("Re-index already in progress, skipping.");
-    return { added: 0, removed: 0, unchanged: 0 };
-  }
-  reindexing = true;
-  try {
-    const { tools: liveTools } = await routerClient.listTools();
-    const newFingerprint = fingerprint(liveTools);
-
-    if (newFingerprint === toolIndex.fingerprint && toolIndex.tools.length > 0) {
-      log(`No changes detected (${liveTools.length} tools).`);
-      return { added: 0, removed: 0, unchanged: liveTools.length };
-    }
-
-    // Load existing embeddings from LanceDB to avoid re-embedding unchanged tools
-    const embeddingCache: Record<string, number[]> = {};
-    if (toolTable) {
-      try {
-        const rows = await toolTable.toArray();
-        for (const row of rows) {
-          const key = row.cacheKey as string;
-          if (key && row.vector) embeddingCache[key] = Array.from(row.vector as number[]);
-        }
-      } catch { /* empty or corrupt — start fresh */ }
-    }
-
-    const liveNames = new Set(liveTools.map((t) => t.name));
-    const removed = toolIndex.tools.map((t) => t.name).filter((n) => !liveNames.has(n));
-
-    // Collect tools that need a new embedding (not in cache)
-    const toEmbed: Array<{ idx: number; text: string; cacheKey: string }> = [];
-    for (const [idx, tool] of liveTools.entries()) {
-      const desc = tool.description ?? "";
-      const cacheKey = `${tool.name}|||${desc}`;
-      if (!embeddingCache[cacheKey]) {
-        toEmbed.push({ idx, text: `${tool.name}: ${desc}`, cacheKey });
-      }
-    }
-
-    // Batch-embed all new tools in chunks — 12x faster than one-at-a-time
-    const BATCH = 64;
-    for (let i = 0; i < toEmbed.length; i += BATCH) {
-      const chunk = toEmbed.slice(i, i + BATCH);
-      const texts = chunk.map((x) => x.text);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const out: any = await (embedder as any)(texts, { pooling: "mean", normalize: true });
-      const embedDim: number = out.dims[out.dims.length - 1];
-      for (let j = 0; j < chunk.length; j++) {
-        embeddingCache[chunk[j].cacheKey] =
-          Array.from(out.data.slice(j * embedDim, (j + 1) * embedDim) as Float32Array);
-      }
-    }
-    const added = toEmbed.length;
-
-    const records: Array<{
-      name: string; description: string; inputSchema: string;
-      cacheKey: string; vector: number[];
-    }> = [];
-    const entries: ToolEntry[] = [];
-
-    for (const tool of liveTools) {
-      const desc = tool.description ?? "";
-      const cacheKey = `${tool.name}|||${desc}`;
-      const vector = embeddingCache[cacheKey];
-      records.push({ name: tool.name, description: desc, inputSchema: JSON.stringify(tool.inputSchema ?? {}), cacheKey, vector });
-      entries.push({ name: tool.name, description: desc, inputSchema: tool.inputSchema, vector });
-    }
-
-    // Overwrite LanceDB table atomically
-    toolTable = await lanceDb.createTable("tools", records, { mode: "overwrite" });
-
-    const unchanged = entries.length - added;
-    const indexedAt = new Date().toISOString();
-    toolIndex = { tools: entries, indexedAt, fingerprint: newFingerprint };
-
-    // Persist fingerprint for fast startup (avoids full re-embed if nothing changed)
-    writeFileSync(META_FILE, JSON.stringify({ fingerprint: newFingerprint, indexedAt }));
-
-    log(`[${reason}] +${added} new, -${removed.length} removed, ${unchanged} unchanged. Total: ${entries.length}.`);
-    return { added, removed: removed.length, unchanged };
-  } finally {
-    reindexing = false;
-  }
-}
-
-function startPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(async () => {
-    if (!routerClient || !routerConnected) return;
-    try {
-      const { tools: liveTools } = await routerClient.listTools();
-      if (fingerprint(liveTools) !== toolIndex.fingerprint) {
-        log("Poll: changes detected — re-indexing...");
-        await buildIndex("poll");
-      }
-    } catch (e) {
-      log(`Poll error: ${e}`);
-    }
-  }, POLL_INTERVAL_MS);
-  log(`Polling every ${POLL_INTERVAL_MS / 1000}s.`);
-}
-
-// ─── MCP Server factory ───────────────────────────────────────────────────────
-
-function createMCPServer(): Server {
-  const server = new Server(
-    { name: "mcp-vector-proxy", version: "1.0.0" },
-    { capabilities: { tools: {} } }
-  );
-
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
-      {
-        name: "discover_tools",
-        description:
-          "Semantic search over all available MCP tools. Returns tools ranked by relevance, each with its exact name, " +
-          "description, relevance score (0–1), and inputSchema showing the required arguments. " +
-          "ALWAYS call this before execute_tool or batch_execute — it gives you the exact tool name and the argument " +
-          "schema you need to call it correctly. " +
-          "Tips: (1) use specific queries ('create a GitHub issue', 'list files in directory') not broad ones " +
-          "('do something with GitHub'); (2) call multiple times with different queries if your task spans multiple " +
-          "domains; (3) relevance above 0.7 is a strong match — below 0.5 the tool is likely unrelated.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "Specific natural language description of the operation you want to perform" },
-            limit: { type: "number", description: `Max results to return (default: ${DISCOVER_LIMIT}). Increase if results seem incomplete.` },
-          },
-          required: ["query"],
-        },
-      },
-      {
-        name: "execute_tool",
-        description:
-          "Execute a single MCP tool by its exact name with arguments matching its inputSchema. " +
-          "Always discover the tool first with discover_tools to get the exact name and required arguments. " +
-          "For multiple independent operations, call this tool in parallel rather than sequentially. " +
-          "For compound tasks that need several tools, prefer batch_execute to run them all in one call.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            tool_name: { type: "string", description: "Exact tool name as returned by discover_tools" },
-            arguments: { type: "object", description: "Arguments matching the tool's inputSchema (from discover_tools results)" },
-          },
-          required: ["tool_name", "arguments"],
-        },
-      },
-      {
-        name: "batch_execute",
-        description:
-          "Execute multiple MCP tools in parallel in a single call. " +
-          "Each entry needs a tool_name (exact, from discover_tools) and its arguments. " +
-          "Results are returned in the same order as the calls array, each with success status. " +
-          "Use this for compound tasks where several tools can run independently " +
-          "(e.g. create a GitHub issue + add a label + post a Slack notification). " +
-          "Much faster than sequential execute_tool calls.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            calls: {
-              type: "array",
-              description: "Tools to execute in parallel",
-              items: {
-                type: "object",
-                properties: {
-                  tool_name: { type: "string", description: "Exact tool name from discover_tools" },
-                  arguments: { type: "object", description: "Arguments matching the tool's inputSchema" },
-                },
-                required: ["tool_name"],
-              },
-            },
-          },
-          required: ["calls"],
-        },
-      },
-      {
-        name: "refresh_tools",
-        description:
-          "Force an immediate re-index of all tools from MCP Router. " +
-          "Use this if discover_tools is not returning tools you know should be available, " +
-          "or after adding a new MCP server to your router.",
-        inputSchema: { type: "object", properties: {} },
-      },
-    ],
-  }));
-
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
-
-    // ── discover_tools ────────────────────────────────────────────────────────
-    if (name === "discover_tools") {
-      if (!routerConnected || toolIndex.tools.length === 0) {
-        return {
-          content: [{ type: "text", text: "MCP Router is not connected yet. Tools will be available shortly — try again in a few seconds." }],
-          isError: true,
-        };
-      }
-      const query = args?.query;
-      if (typeof query !== "string" || !query.trim()) {
-        return { content: [{ type: "text", text: "query is required and must be a non-empty string." }], isError: true };
-      }
-      const limit = (args?.limit as number) ?? DISCOVER_LIMIT;
-
-      // 1. Dense vector search — in-memory cosine scan (<1ms for ≤10K tools)
-      const queryEmbedding = await embed(query);
-      const vectorHits = toolIndex.tools
-        .map(t => ({ name: t.name, score: cosine(queryEmbedding, t.vector) }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, limit * 3);
-
-      // 2. BM25 keyword search over in-memory tool list
-      const queryTerms = query.toLowerCase().match(/\w+/g) ?? [];
-      const avgDocLen = toolIndex.tools.reduce(
-        (s, t) => s + `${t.name} ${t.description}`.split(/\W+/).length, 0
-      ) / Math.max(toolIndex.tools.length, 1);
-
-      const bm25Hits = toolIndex.tools
-        .map(t => ({ name: t.name, score: bm25Score(queryTerms, `${t.name} ${t.description}`, avgDocLen) }))
-        .filter(r => r.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, limit * 3);
-
-      // 3. Reciprocal Rank Fusion (vector ranking already sorted by score desc)
-      const fusedNames = rrfFuse(
-        [vectorHits.map(r => r.name), bm25Hits.map(r => r.name)],
-        limit
-      );
-
-      // 4. Build results — relevance is cosine similarity (0–1, already normalized)
-      const scoreMap = new Map(vectorHits.map(r => [r.name, r.score]));
-      const toolMap  = new Map(toolIndex.tools.map(t => [t.name, t]));
-
-      const results = fusedNames
-        .map(n => {
-          const tool = toolMap.get(n);
-          if (!tool) return null;
-          return {
-            name:        tool.name,
-            description: tool.description,
-            relevance:   parseFloat((scoreMap.get(n) ?? 0).toFixed(4)),
-            inputSchema: tool.inputSchema,
-          };
-        })
-        .filter(Boolean);
-
-      return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
-    }
-
-    // ── execute_tool ──────────────────────────────────────────────────────────
-    if (name === "execute_tool") {
-      if (!routerClient || !routerConnected) {
-        return { content: [{ type: "text", text: "MCP Router is not connected. Please wait for reconnection." }], isError: true };
-      }
-      const toolName = args?.tool_name;
-      if (typeof toolName !== "string" || !toolName.trim()) {
-        return { content: [{ type: "text", text: "tool_name is required and must be a non-empty string." }], isError: true };
-      }
-      return await routerClient.callTool({ name: toolName, arguments: (args?.arguments ?? {}) as Record<string, unknown> });
-    }
-
-    // ── batch_execute ─────────────────────────────────────────────────────────
-    if (name === "batch_execute") {
-      if (!routerClient || !routerConnected) {
-        return { content: [{ type: "text", text: "MCP Router is not connected. Please wait for reconnection." }], isError: true };
-      }
-      const calls = args?.calls as Array<{ tool_name?: unknown; arguments?: unknown }> | undefined;
-      if (!Array.isArray(calls) || calls.length === 0) {
-        return { content: [{ type: "text", text: "calls must be a non-empty array of {tool_name, arguments} objects." }], isError: true };
-      }
-      for (const call of calls) {
-        if (typeof call.tool_name !== "string" || !call.tool_name.trim()) {
-          return { content: [{ type: "text", text: "Each call must have a non-empty tool_name string." }], isError: true };
-        }
-      }
-      const results = await Promise.all(
-        calls.map(async (call) => {
-          const toolName = call.tool_name as string;
-          try {
-            const result = await routerClient!.callTool({
-              name: toolName, arguments: (call.arguments ?? {}) as Record<string, unknown>,
-            });
-            return { tool_name: toolName, success: true, result };
-          } catch (e) {
-            return { tool_name: toolName, success: false, error: String(e) };
-          }
-        })
-      );
-      return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
-    }
-
-    // ── refresh_tools ─────────────────────────────────────────────────────────
-    if (name === "refresh_tools") {
-      const result = await buildIndex("manual");
-      return {
-        content: [{
-          type: "text",
-          text: routerConnected
-            ? `Re-indexed: ${toolIndex.tools.length} tools (+${result.added} new, -${result.removed} removed). Updated: ${toolIndex.indexedAt}`
-            : "MCP Router not connected — cannot refresh.",
-        }],
-      };
-    }
-
-    throw new Error(`Unknown tool: ${name}`);
-  });
-
-  return server;
-}
+process.on("SIGTERM", () => void shutdown());
+process.on("SIGINT", () => void shutdown());
 
 // ─── HTTP mode ────────────────────────────────────────────────────────────────
 
-async function runHttp(port: number, host: string) {
+function runHttp(port: number, host: string): void {
+  // Refuse unsafe bind targets. execute_tool has no auth — binding 0.0.0.0
+  // would let anyone on the LAN call any MCP tool. Opt in explicitly.
+  const unsafe = host === "0.0.0.0" || host === "::";
+  if (unsafe && !ALLOW_REMOTE) {
+    process.stderr.write(
+      `[mcp-vector-proxy] Fatal: HTTP_HOST=${host} would expose the proxy to your network with no auth.\n` +
+      `  This is dangerous — execute_tool can call any of your MCP tools.\n` +
+      `  If you really want this, set ALLOW_REMOTE=1 AND set an AUTH_TOKEN.\n`
+    );
+    process.exit(1);
+  }
+  if (unsafe) {
+    log(`WARNING: binding to ${host} with ALLOW_REMOTE=1. Ensure AUTH_TOKEN is set.`);
+  }
+
   const app = createMcpExpressApp({ host });
   app.use(express.json());
+
+  // Dashboard (HTML) + read-only JSON helpers — mounted before session routes.
+  app.use(createDashboardRouter(vectorIndex, router, activity, stats));
+
+  // ── Streamable HTTP sessions ────────────────────────────────────────────
 
   const streamableSessions = new Map<string, StreamableHTTPServerTransport>();
 
@@ -588,79 +79,63 @@ async function runHttp(port: number, host: string) {
       return;
     }
     if (req.method !== "POST") { res.status(400).json({ error: "POST to /mcp to start a session." }); return; }
+
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sid) => { streamableSessions.set(sid, transport); log(`Session: ${sid}`); },
       onsessionclosed: (sid) => { streamableSessions.delete(sid); },
     });
-    const server = createMCPServer();
+    const server = createMCPServer(vectorIndex, router, activity, stats);
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   });
 
-  const sseSessions = new Map<string, SSEServerTransport>();
-
-  app.get("/sse", async (req, res) => {
-    const transport = new SSEServerTransport("/messages", res);
-    const server = createMCPServer();
-    await server.connect(transport);
-    sseSessions.set(transport.sessionId, transport);
-    transport.onclose = () => sseSessions.delete(transport.sessionId);
-  });
-
-  app.post("/messages", async (req, res) => {
-    const sessionId = req.query["sessionId"] as string;
-    const transport = sseSessions.get(sessionId);
-    if (!transport) { res.status(404).json({ error: "Session not found." }); return; }
-    await transport.handlePostMessage(req, res, req.body);
-  });
+  // ── Health endpoint ────────────────────────────────────────────────────
 
   app.get("/health", (_req, res) => {
     res.json({
-      status:         routerConnected ? "ok" : "disconnected",
-      routerConnected,
-      tools:          toolIndex.tools.length,
-      indexedAt:      toolIndex.indexedAt || null,
-      sessions:       { streamable: streamableSessions.size, sse: sseSessions.size },
+      status: router.isConnected ? "ok" : "disconnected",
+      routerConnected: router.isConnected,
+      tools: vectorIndex.toolCount,
+      indexedAt: vectorIndex.indexedAt || null,
+      lastError: router.lastError || null,
+      sessions: { streamable: streamableSessions.size },
     });
   });
 
-  app.listen(port, host, () => {
-    log(`HTTP on http://${host}:${port}`);
+  // Listen without specifying host so Node binds to :: (dual-stack).
+  // This accepts both IPv4 (127.0.0.1) and IPv6 ([::1]) connections,
+  // fixing the issue where some MCP clients resolve 'localhost' to [::1].
+  app.listen(port, () => {
+    log(`HTTP on port ${port} (dual-stack: IPv4 + IPv6)`);
     log(`  Streamable HTTP : POST/GET/DELETE /mcp`);
-    log(`  SSE (legacy)    : GET /sse`);
     log(`  Health          : GET /health`);
+    log(`  Dashboard       : GET /`);
   });
 }
 
 // ─── Stdio mode ───────────────────────────────────────────────────────────────
 
-async function runStdio() {
-  const server = createMCPServer();
+async function runStdio(): Promise<void> {
+  const server = createMCPServer(vectorIndex, router, activity, stats);
   await server.connect(new StdioServerTransport());
 }
 
-// ─── Entry point ──────────────────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function main() {
-  // Init LanceDB first — loads cached embeddings so proxy can serve immediately
-  await initLanceDb();
+async function main(): Promise<void> {
+  // Init LanceDB cache + embedding model
+  await vectorIndex.init();
 
-  log("Loading embedding model (mxbai-embed-xsmall-v1, ~23MB)...");
-  embedder = await pipeline(
-    "feature-extraction",
-    "mixedbread-ai/mxbai-embed-xsmall-v1",
-    { dtype: "q8", device: "cpu" }
-  );
-  log("Model ready.");
-
+  // Start transport
   if (HTTP_PORT) {
-    await runHttp(HTTP_PORT, HTTP_HOST);
+    runHttp(HTTP_PORT, HTTP_HOST);
   } else {
     await runStdio();
   }
 
-  connectToRouterWithRetry().catch((e) => log(`Router connect error: ${e}`));
+  // Connect to MCP Router (runs in background with auto-reconnect)
+  router.connect().catch((e) => log(`Router connect error: ${e}`));
 }
 
 main().catch((e) => {

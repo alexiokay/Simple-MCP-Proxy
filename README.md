@@ -18,11 +18,12 @@ MCP Router (all your servers)
         │ stdio
         ▼
 mcp-vector-proxy  (tray-managed background process, port 3456)
-  - Local embeddings: EmbeddingGemma-300M q8 (~150MB, runs offline)
-  - LanceDB vector store (persistent, handles 1M+ tools, no server)
-  - Hybrid search: dense vector + BM25 keyword + RRF fusion
+  - Local embeddings: mxbai-embed-xsmall-v1 q8 (~23MB, runs offline)
+  - LanceDB persistence layer (saves embeddings across restarts)
+  - In-memory hybrid search: dense vector + BM25 keyword + RRF fusion (<1ms for ≤10K tools)
   - Auto-syncs when tools change (MCP notifications + polling)
-  - HTTP: Streamable HTTP + SSE legacy
+  - HTML dashboard at / + JSON /health
+  - HTTP: Streamable HTTP only (SSE dropped — no known client used it)
         │
         ├── Claude Code / other agents  (HTTP → :3456/mcp)
         │
@@ -30,9 +31,10 @@ mcp-vector-proxy  (tray-managed background process, port 3456)
 
 System tray  (node dist/tray.js, auto-starts on login)
   - Green  = connected, N tools indexed
-  - Yellow = MCP Router reconnecting
+  - Yellow = MCP Router reconnecting (cache still serves discover_tools)
   - Red    = proxy down / crashed (auto-restarts)
-  - Right-click → Restart Proxy / Open Health URL / Exit
+  - Right-click → Open Dashboard / Open Log File / Restart Proxy / Exit
+  - Proxy logs to ~/.mcp-proxy/proxy.log
 ```
 
 ## Requirements
@@ -42,7 +44,7 @@ System tray  (node dist/tray.js, auto-starts on login)
 - **macOS:** macOS 10.15+
 - **Linux:** Any desktop with a system tray (GNOME, KDE, etc.)
 
-> **First run:** EmbeddingGemma-300M (~150MB) downloads automatically on first startup and is cached to `.model-cache/`. Subsequent starts are instant.
+> **First run:** mxbai-embed-xsmall-v1 (~23MB) downloads automatically on first startup and is cached to `.model-cache/`. Subsequent starts are instant.
 
 ## Setup
 
@@ -105,7 +107,7 @@ This registers the tray to start on every login and launches it immediately.
 }
 ```
 
-**Any other agent** — point it at `http://127.0.0.1:3456/mcp` (Streamable HTTP) or `http://127.0.0.1:3456/sse` (SSE legacy).
+**Any other agent** — point it at `http://127.0.0.1:3456/mcp` (Streamable HTTP).
 
 ## Environment Variables
 
@@ -113,9 +115,36 @@ This registers the tray to start on every login and launches it immediately.
 |---|---|---|
 | `MCPR_TOKEN` | *(from .env)* | MCP Router auth token — required |
 | `HTTP_PORT` | *(none = stdio mode)* | Port for HTTP server |
-| `HTTP_HOST` | `127.0.0.1` | Bind address |
+| `HTTP_HOST` | `127.0.0.1` | Bind address. `0.0.0.0` / `::` require `ALLOW_REMOTE=1` |
+| `ALLOW_REMOTE` | *(unset)* | Opt-in for non-loopback bind (no auth on `execute_tool` — leave unset unless you know what you're doing) |
+| `AUTH_TOKEN` | *(unset)* | Reserved for future bearer-token gate when remote is enabled |
+| `ALLOW_TOOLS` | *(unset)* | Comma-separated regex patterns. If set, only matching tools are indexed and callable. |
+| `DENY_TOOLS` | *(unset)* | Comma-separated regex patterns. Matching tools are hidden and refused at execute time. |
 | `POLL_INTERVAL_MS` | `15000` | Tool change polling interval |
 | `DISCOVER_LIMIT` | `10` | Default max results from `discover_tools` |
+
+## Tool Allow/Deny Lists
+
+Scope what the proxy exposes to agents. Patterns are JavaScript regex matched against tool names. Comma-separated.
+
+```bash
+# Only expose GitHub and Slack tools
+ALLOW_TOOLS=^github_.*,^slack_.*
+
+# Hide anything destructive plus the admin tools
+DENY_TOOLS=.*_delete_.*,^admin_.*
+
+# Lock down to a single specific tool
+ALLOW_TOOLS=^gmail_send_email$
+```
+
+Enforcement is layered:
+
+1. **Index time** — denied tools are never embedded, never appear in `discover_tools` results
+2. **Execute time** — `execute_tool` and `batch_execute` refuse denied tools with a clear error, even if the agent learned the name out-of-band
+3. **Fingerprint** — computed on the filtered list, so changes to filtered-out tools don't trigger re-indexing
+
+When active, the dashboard shows a yellow banner with the patterns. Changes require a proxy restart.
 
 ## Tools Exposed to Agents
 
@@ -156,50 +185,88 @@ GET http://127.0.0.1:3456/health
   "routerConnected": true,
   "tools": 151,
   "indexedAt": "2026-02-17T15:51:21.620Z",
-  "sessions": { "streamable": 1, "sse": 0 }
+  "lastError": null,
+  "sessions": { "streamable": 1 }
 }
 ```
 
-Status is `"ok"` when MCP Router is connected and tools are indexed. `"disconnected"` means the proxy is up but MCP Router is unreachable (it will auto-reconnect).
+Status is `"ok"` when MCP Router is connected and tools are indexed. `"disconnected"` means the proxy is up but MCP Router is unreachable — `discover_tools` still works from cache, `execute_tool` will fail until reconnection.
+
+## Dashboard
+
+Open `http://127.0.0.1:3456/` in a browser (or use the tray's **Open Dashboard** menu item) for:
+
+- Live status card (connection, tool count, indexedAt, sessions)
+- **Search playground** — type a query, see ranked results with relevance bars and argument schemas
+- **Tool browser** — searchable list of all indexed tools with click-to-copy names
+- **Recent activity** — last 20 discover/execute/batch calls with latency, p50/p99 summary
+- **Refresh button** — triggers an immediate re-index
+
+Read-only JSON helpers (used by the dashboard, also useful for scripting):
+
+- `GET /discover?q=<query>&limit=<n>` — same ranking as `discover_tools`
+- `GET /tools` — all indexed tools as JSON
+- `POST /refresh` — trigger re-index
+
+## Log File
+
+The tray pipes the proxy child's stdout/stderr to `~/.mcp-proxy/proxy.log`. Use the tray's **Open Log File** menu item or:
+
+```bash
+# Follow live
+tail -f ~/.mcp-proxy/proxy.log        # macOS/Linux
+Get-Content ~\.mcp-proxy\proxy.log -Wait   # Windows PowerShell
+```
+
+This is the first place to look when the proxy "didn't start on boot".
 
 ## File Reference
 
 ```
 src/
-  index.ts          — Main proxy server (HTTP + stdio modes, hybrid vector search)
-  stdio-bridge.ts   — Thin stdio→HTTP forwarder for Claude Desktop
-  launch-router.ts  — Spawns MCP Router CLI with windowsHide:true
+  index.ts          — Main proxy server (HTTP + stdio modes, mounts dashboard)
+  server.ts         — MCP tool handlers (discover / execute / batch / refresh)
+  dashboard.ts      — HTML dashboard + /discover + /tools read-only routes
+  vector-index.ts   — Embeddings + in-memory hybrid search + LanceDB cache
+  search.ts         — Pure cosine / BM25 / RRF functions
+  router-connection.ts — MCP Router child lifecycle, reconnection, polling
+  launch-router.ts  — Spawns MCP Router CLI (offline after first install)
   tray.ts           — Cross-platform system tray (systray2)
+  config.ts         — Env loading + typed constants
 
 dist/               — Compiled output (generated by npm run build)
 
 .env.example        — Template for .env (copy and fill in MCPR_TOKEN)
 .env                — Your config (gitignored, never commit this)
 
-setup.ps1           — Windows: register auto-start + launch tray
-setup.sh            — macOS/Linux: register auto-start + launch tray
+setup.ps1           — Windows: install CLI locally + register auto-start + launch tray
+setup.sh            — macOS/Linux: same
 restart-tray.ps1    — Windows: kill + restart tray
-restart-tray.sh     — macOS/Linux: kill + restart tray
+restart-tray.sh     — macOS/Linux: same
 
-.lancedb/           — LanceDB vector store (auto-generated, gitignored)
+.lancedb/           — LanceDB persistence (auto-generated, gitignored)
 .tool-meta.json     — Tool fingerprint cache (auto-generated, gitignored)
-.model-cache/       — Downloaded embedding model (~150MB, gitignored)
+.model-cache/       — Downloaded embedding model (~23MB, gitignored)
+~/.mcp-proxy/proxy.log — Runtime log written by tray (rotated manually)
 ```
 
 ## How Tool Sync Works
 
-1. On startup, tools from MCP Router are embedded using EmbeddingGemma-300M and stored in LanceDB
+1. On startup, tools from MCP Router are embedded using mxbai-embed-xsmall-v1 and cached in LanceDB
 2. MCP Router sends a `tools/list_changed` notification when servers change → immediate re-index
 3. A polling fallback runs every 15s to catch any missed notifications
 4. Re-indexing is incremental — only new or changed tools get re-embedded, cached embeddings are reused
 5. Tool schema changes (new parameters) are detected via fingerprint and trigger re-indexing
+6. If MCP Router is unreachable, `discover_tools` still serves from the in-memory cache; only `execute_tool` requires a live router
 
 ## How Search Works
 
 `discover_tools` uses **hybrid search** for best accuracy:
 
-1. **Dense vector search** — LanceDB finds semantically similar tools using EmbeddingGemma-300M embeddings (handles paraphrasing, synonyms, conceptual matches)
+1. **Dense vector search** — in-memory cosine similarity over mxbai-embed-xsmall-v1 embeddings (handles paraphrasing, synonyms, conceptual matches; <1ms for ≤10K tools)
 2. **BM25 keyword search** — in-memory scoring finds exact tool name / keyword matches that semantic search can miss
 3. **RRF fusion** — Reciprocal Rank Fusion merges both ranked lists into a single optimal ranking
 
-This combination handles both vague queries ("something to do with files") and precise queries ("browser_screenshot") accurately at any scale.
+LanceDB is used purely as a persistence layer — embeddings are reloaded into memory at startup so search never touches disk. Practical ceiling is roughly 10K tools (limited by RAM and the linear scan), not 1M+.
+
+This combination handles both vague queries ("something to do with files") and precise queries ("browser_screenshot") accurately.
