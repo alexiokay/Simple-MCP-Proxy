@@ -5,8 +5,11 @@ MCP-Proxy.exe
 .tool-index.json.tmp
 .model-cache/
 .lancedb/
+.sqlite-vec/
 .tool-meta.json
 .env
 config.json
 .node-path
 improvements hmm.txt
+tray-rs/target/
+tray-rs/Cargo.lock

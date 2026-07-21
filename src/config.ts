@@ -72,9 +72,14 @@ export const DENY_TOOLS: string[] = (process.env.DENY_TOOLS ?? "")
 // ─── Paths ────────────────────────────────────────────────────────────────────
 
 export const DIST_DIR = __dirname;
-export const LANCE_DIR = path.join(__dirname, "../.lancedb");
+export const DB_PATH = process.env.DB_PATH ?? path.join(__dirname, "../.sqlite-vec/proxy.db");
 export const META_FILE = path.join(__dirname, "../.tool-meta.json");
 export const MODEL_CACHE = path.join(__dirname, "../.model-cache");
+
+// Embedding dimension. mxbai-embed-xsmall-v1 = 384.
+// If you change the embedding model, you MUST delete .sqlite-vec/ and restart —
+// vec0 virtual tables are dimension-locked at creation time.
+export const MODEL_DIM = parseInt(process.env.MODEL_DIM ?? "384", 10);
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 

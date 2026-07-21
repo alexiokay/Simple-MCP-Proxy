@@ -2,19 +2,17 @@
  * Shared type definitions for the MCP Vector Proxy.
  */
 
-/** A tool with its precomputed embedding vector, kept in memory for sub-ms cosine search. */
+/**
+ * A tool with its metadata. The `vector` field is kept for type compatibility
+ * but is unused in the SQLite-backed VectorIndex (vectors live in vec0).
+ * Kept here so the in-memory metadata list has a stable shape.
+ */
 export interface ToolEntry {
     name: string;
     description: string;
     inputSchema: unknown;
+    /** Unused in SQLite backend — vectors are stored in vec0 and fetched on search. */
     vector: number[];
-}
-
-/** The full in-memory tool index with change-detection fingerprint. */
-export interface ToolIndex {
-    tools: ToolEntry[];
-    indexedAt: string;
-    fingerprint: string;
 }
 
 /** Result summary from a buildIndex operation. */
@@ -22,15 +20,6 @@ export interface IndexResult {
     added: number;
     removed: number;
     unchanged: number;
-}
-
-/** A single row stored in the LanceDB "tools" table. */
-export interface LanceToolRecord {
-    name: string;
-    description: string;
-    inputSchema: string; // JSON-serialized
-    cacheKey: string;
-    vector: number[];
 }
 
 /** Persisted metadata for fast startup (avoids full re-embed when nothing changed). */

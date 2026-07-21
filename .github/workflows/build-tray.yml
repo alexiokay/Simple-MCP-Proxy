@@ -1,0 +1,126 @@
+name: Build Tray Binaries
+
+# Builds the Rust tray binary for all 6 platform/arch combos.
+# - On push/main: upload artifacts for download
+# - On tag (v*): attach binaries to a GitHub release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tray-rs/**"
+      - ".github/workflows/build-tray.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows x64 (native on windows-latest)
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: win
+            arch: x64
+            ext: ".exe"
+          # Windows ARM64 (cross-compile on windows-latest)
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            platform: win
+            arch: arm64
+            ext: ".exe"
+          # macOS Intel (native on macos-13)
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            platform: macos
+            arch: x64
+            ext: ""
+          # macOS Apple Silicon (native on macos-latest)
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos
+            arch: arm64
+            ext: ""
+          # Linux x64 (native on ubuntu-latest)
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: x64
+            ext: ""
+          # Linux ARM64 (cross-compile on ubuntu-latest)
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            arch: arm64
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux ARM64 cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build
+        working-directory: tray-rs
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        id: rename
+        shell: bash
+        run: |
+          mkdir -p dist/tray
+          BIN_NAME="mcp-tray-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.ext }}"
+          SRC="tray-rs/target/${{ matrix.target }}/release/mcp-tray${{ matrix.ext }}"
+          cp "$SRC" "dist/tray/$BIN_NAME"
+          echo "binary=dist/tray/$BIN_NAME" >> $GITHUB_OUTPUT
+          ls -la "dist/tray/$BIN_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-tray-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ steps.rename.outputs.binary }}
+          if-no-files-found: error
+
+  release:
+    name: Bundle Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Display structure
+        run: ls -la artifacts
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

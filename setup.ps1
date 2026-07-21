@@ -78,18 +78,22 @@ Write-Host "Tray launched." -ForegroundColor Green
 Start-Sleep 4
 
 # -- 6. Pin to taskbar (not hidden in overflow) -------------------------------
+# Windows 11 hides tray icons by default. Two strategies:
+#   a) Set IsPromoted=1 in NotifyIconSettings registry (auto, requires icon to exist)
+#   b) User drags the icon out of the overflow manually (instant, always works)
+# Try (a) for both node-spawned (legacy) and mcp-tray-rs paths.
 $pinned = $false
 Get-ChildItem "HKCU:\Control Panel\NotifyIconSettings" -ErrorAction SilentlyContinue | ForEach-Object {
     $v = Get-ItemProperty $_.PSPath
-    if ($v.ExecutablePath -like "*node*") {
+    if ($v.ExecutablePath -like "*node*" -or $v.ExecutablePath -like "*mcp-tray*") {
         Set-ItemProperty $_.PSPath -Name "IsPromoted" -Value 1
         $pinned = $true
     }
 }
 if ($pinned) {
-    Write-Host "Icon pinned to taskbar." -ForegroundColor Green
+    Write-Host "Icon pinned to taskbar (registry)." -ForegroundColor Green
 } else {
-    Write-Host "Tip: click the ^ in your taskbar, find MCP Proxy, right-click -> 'Always show'." -ForegroundColor Yellow
+    Write-Host "Tip: click the ^ in your taskbar, drag the MCP Proxy icon to the taskbar to pin it." -ForegroundColor Yellow
 }
 
 # -- 7. Compile MCP-Proxy.exe launcher ----------------------------------------

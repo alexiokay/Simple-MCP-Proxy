@@ -4,19 +4,23 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node -e \"const p=process.platform;const {execSync}=require('child_process');try{if(p==='win32'){execSync('powershell -ExecutionPolicy Bypass -File build-tray.ps1',{stdio:'inherit'})}else{execSync('bash build-tray.sh',{stdio:'inherit'})}}catch(e){console.error('Tray build skipped:',e.message)}\"",
+    "build:ts": "tsc",
+    "build:tray": "node -e \"const p=process.platform;const {execSync}=require('child_process');if(p==='win32'){execSync('powershell -ExecutionPolicy Bypass -File build-tray.ps1',{stdio:'inherit'})}else{execSync('bash build-tray.sh',{stdio:'inherit'})}\"",
+    "postinstall": "node scripts/fetch-tray.js",
     "make-exe": "powershell -ExecutionPolicy Bypass -File make-exe.ps1",
     "setup": "node -e \"const p=process.platform;const {execSync}=require('child_process');if(p==='win32'){execSync('powershell -ExecutionPolicy Bypass -File setup.ps1',{stdio:'inherit'})}else{execSync('bash setup.sh',{stdio:'inherit'})}\"",
     "update": "npm run build && node -e \"const p=process.platform;const {execSync}=require('child_process');if(p==='win32'){execSync('powershell -ExecutionPolicy Bypass -File restart-tray.ps1',{stdio:'inherit'})}else{execSync('bash restart-tray.sh',{stdio:'inherit'})}\""
   },
   "dependencies": {
     "@huggingface/transformers": "^3.8.1",
-    "@lancedb/lancedb": "0.26.2",
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "better-sqlite3": "^11.5.0",
     "express": "^5.2.1",
-    "systray2": "^2.1.4"
+    "sqlite-vec": "^0.1.6"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
     "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
     "typescript": "^5.9.0"

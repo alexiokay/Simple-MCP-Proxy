@@ -190,20 +190,25 @@ Task Scheduler / launchd / systemd
 
 ---
 
-### Native Windows ARM64 build (unblocked after above two)
+### Native Windows ARM64 build (unblocked + DONE)
 
 After sqlite-vec migration + Rust tray, the ARM blockers are gone:
 - ~~`@lancedb/lancedb`~~ → sqlite-vec (ARM native via better-sqlite3)
 - ~~`systray2`~~ → Rust tray binary (native ARM via `tray-icon` crate)
 
-Remaining work:
-- Verify `@huggingface/transformers` runs on WoA (pure JS + WASM, should work)
-- Verify `better-sqlite3` loads its prebuilt ARM64 binary on WoA
-- Test on actual ARM hardware (Surface Pro X / Snapdragon)
-- Update README to advertise ARM support
+What's wired up:
+- ✅ CI builds 6 platform/arch combos via GitHub Actions
+- ✅ Postinstall auto-downloads right binary for current platform
+- ✅ Cross-compile docs in README
+- ✅ Platform support matrix in README
 
-**Effort:** ~2 hours after the above.
-**Impact:** Full native ARM64 Windows support, parity with x64.
+Still pending (needs real hardware):
+- Verify `@huggingface/transformers` runs on WoA (pure JS + WASM, should work)
+- Verify `better-sqlite3` ARM64 binary loads on Windows ARM
+- Smoke test on Surface Pro X / Snapdragon laptops
+
+**Effort:** Done in code; ~1-2 hours of testing pending hardware.
+**Impact:** Full native ARM64 support claimed, awaiting validation.
 
 ---
 
