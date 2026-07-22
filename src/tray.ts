@@ -130,6 +130,12 @@ function spawnTray(): void {
         const ev = JSON.parse(line);
         if (ev.type === "click" && typeof ev.seq_id === "number") {
           handleClick(ev.seq_id);
+        } else if (ev.type === "wake") {
+          handleWake();
+        } else if (ev.type === "sleep") {
+          // Informational only - no action needed.
+          // Proxy will continue running; MCP Router may need to reconnect,
+          // which router-connection.ts handles via its existing backoff.
         }
       } catch { /* malformed */ }
     }
@@ -214,7 +220,14 @@ function openUrl(url: string): void {
 
 function openLogFile(): void {
   if (IS_WIN) {
-    spawn("cmd", ["/c", "start", "", LOG_FILE], { shell: true, stdio: "ignore", detached: true }).unref();
+    // Use `start` with proper quoting. The path may contain spaces
+    // (C:\Users\<name>\...), and unquoted it parses as multiple args.
+    // windowsHide:false so the editor shows up; detached so Node doesn't wait.
+    spawn("cmd.exe", ["/c", "start", "", `"${LOG_FILE}"`], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false,
+    }).unref();
   } else {
     openUrl(LOG_FILE);
   }
@@ -239,6 +252,16 @@ function handleClick(seqId: number): void {
       exitCleanly();
       break;
   }
+}
+
+/** System resumed from sleep - restart proxy so it cleanly reconnects. */
+function handleWake(): void {
+  const logStream = openLog();
+  logToBoth(logStream, `── system woke from sleep - restarting proxy ──`);
+  updateTray("yellow", "Waking - reconnecting...", "MCP Proxy - reconnecting after sleep");
+  killProxy();
+  // Short delay so the network interface has a chance to come back.
+  setTimeout(startProxy, 2000);
 }
 
 function exitCleanly(): void {

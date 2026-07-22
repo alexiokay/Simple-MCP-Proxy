@@ -3,6 +3,8 @@
 //! JSON-lines protocol over stdin/stdout:
 //!   parent -> tray:  {"type":"menu","icon":"green","tooltip":"...","items":[{"title":"...","enabled":true,"separator":false}]}
 //!   tray  -> parent: {"type":"click","seq_id":2}
+//!                  | {"type":"wake"}                   (system resumed from sleep)
+//!                  | {"type":"sleep"}                  (system about to sleep)
 //!
 //! Items are rendered in order. Each non-separator, enabled item gets an auto-incremented
 //! seq_id matching its position in the items array (skipping separators in the count).
@@ -19,6 +21,98 @@ use tao::{
 };
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+#[cfg(windows)]
+mod power {
+    //! Windows power event notification via PowerRegisterSuspendResumeNotification.
+    //! Emits {"type":"wake"|"sleep"} JSON to stdout when system state changes.
+
+    use std::ffi::c_void;
+    use std::io::Write;
+    use std::sync::mpsc::Sender;
+    use std::thread;
+    use std::time::Duration;
+
+    use crate::PowerEvent;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Power::{
+        PowerRegisterSuspendResumeNotification, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{DEVICE_NOTIFY_CALLBACK, REGISTER_NOTIFICATION_FLAGS};
+
+    const PBT_APMSUSPEND: u32 = 4;
+    const PBT_APMRESUMECRITICAL: u32 = 6;
+    const PBT_APMRESUMESUSPEND: u32 = 7;
+    const PBT_APMRESUMEAUTOMATIC: u32 = 18;
+
+    /// Spawn a thread that registers for power events and forwards them on `tx`.
+    /// Returns immediately; the registration lives until the process exits.
+    pub fn spawn(tx: Sender<PowerEvent>) {
+        thread::spawn(move || {
+            // Box the sender so the C callback can read it via the context pointer.
+            let tx_box: Box<Sender<PowerEvent>> = Box::new(tx);
+            let context = Box::into_raw(tx_box) as *mut c_void;
+
+            // Callback: Windows calls this on power state changes.
+            // Must be `extern "system"` and use raw pointers.
+            unsafe extern "system" fn callback(
+                context: *const c_void,
+                change_type: u32,
+                _setting: *const c_void,
+            ) -> u32 {
+                let tx = &*(context as *const Sender<PowerEvent>);
+                let event = match change_type {
+                    PBT_APMSUSPEND => PowerEvent::Sleep,
+                    PBT_APMRESUMECRITICAL
+                    | PBT_APMRESUMESUSPEND
+                    | PBT_APMRESUMEAUTOMATIC => PowerEvent::Wake,
+                    _ => return 1, // unhandled - still return success
+                };
+                // Ignore send errors (parent gone = process shutting down)
+                let _ = tx.send(event);
+                1 // success
+            }
+
+            let params = DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
+                Callback: Some(callback),
+                Context: context,
+            };
+
+            unsafe {
+                // PowerRegisterSuspendResumeNotification signature in 0.61:
+                //   flags: REGISTER_NOTIFICATION_FLAGS  (use DEVICE_NOTIFY_CALLBACK)
+                //   recipient: HANDLE                   (cast pointer to params struct)
+                //   registrationhandle: *mut *mut c_void (output, just keep alive)
+                let mut registration: *mut c_void = std::ptr::null_mut();
+                let recipient = HANDLE(&params as *const _ as *mut c_void);
+                let r = PowerRegisterSuspendResumeNotification(
+                    DEVICE_NOTIFY_CALLBACK,
+                    recipient,
+                    &mut registration,
+                );
+                if r.is_err() {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[mcp-tray] PowerRegisterSuspendResumeNotification failed: {:?}",
+                        r
+                    );
+                    return;
+                }
+                // Block forever - the registration must stay alive.
+                // The handle is intentionally leaked; OS cleans up on process exit.
+                loop {
+                    thread::sleep(Duration::from_secs(3600));
+                }
+            }
+        });
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PowerEvent {
+    Sleep,
+    Wake,
+}
 
 #[derive(Debug, Deserialize)]
 struct MenuItemSpec {
@@ -55,6 +149,7 @@ struct ClickEvent<'a> {
 enum UserEvent {
     Update(Msg),
     MenuClick(MenuEvent),
+    Power(PowerEvent),
 }
 
 // Map from tray-icon internal menu id (stringified) -> seq_id the parent expects.
@@ -91,6 +186,19 @@ fn main() {
         // stdin closed -> parent went away -> exit
         std::process::exit(0);
     });
+
+    // Power events: spawn callback registrar, forward via mpsc into the event loop.
+    #[cfg(windows)]
+    {
+        let (tx, rx) = std::sync::mpsc::channel::<PowerEvent>();
+        power::spawn(tx);
+        let proxy_for_power = proxy.clone();
+        thread::spawn(move || {
+            while let Ok(ev) = rx.recv() {
+                let _ = proxy_for_power.send_event(UserEvent::Power(ev));
+            }
+        });
+    }
 
     let mut tray: Option<TrayIcon> = None;
     let seq_map: SeqMap = Arc::new(Mutex::new(Vec::new()));
@@ -147,6 +255,16 @@ fn main() {
                             });
                         }
                     }
+                }
+                UserEvent::Power(ev) => {
+                    // Forward power state to parent as JSON line.
+                    let kind = match ev {
+                        PowerEvent::Wake => "wake",
+                        PowerEvent::Sleep => "sleep",
+                    };
+                    let mut out = std::io::stdout().lock();
+                    let _ = writeln!(out, "{{\"type\":\"{kind}\"}}");
+                    let _ = out.flush();
                 }
             }
         }

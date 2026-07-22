@@ -2,6 +2,10 @@
 # Pre-installs the MCP Router CLI, bakes the absolute node path, registers a
 # Task Scheduler entry for auto-start on login (with retry-on-failure), and
 # launches the tray now.
+#
+# Sleep/wake resilience is handled INSIDE the Rust tray binary via
+# PowerRegisterSuspendResumeNotification (not via Task Scheduler triggers).
+# This is the proper event-driven way; no polling watchdog needed.
 
 $scriptDir  = $PSScriptRoot
 $trayScript = Join-Path $scriptDir "dist\tray.js"
@@ -32,9 +36,10 @@ $nodePathFile = Join-Path $scriptDir ".node-path"
 Set-Content -Path $nodePathFile -Value $nodePath -Encoding ascii -NoNewline
 Write-Host "Baked node path -> $nodePath" -ForegroundColor Green
 
-# -- 3. Migrate HKCU Run key to Task Scheduler --------------------------------
-# Task Scheduler is more reliable than the Run key: supports delay, retry on
-# failure, and runs even after PIN/biometric resume (the Run key is flaky there).
+# -- 3. Register Task Scheduler entry -----------------------------------------
+# AtLogon trigger handles initial startup. Sleep/wake is handled by the Rust
+# tray binary itself (PowerRegisterSuspendResumeNotification) - it emits
+# {"type":"wake"} to tray.ts which restarts the proxy.
 
 # Remove any previous Run-key entry (legacy from older setup.ps1 versions).
 $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
@@ -43,10 +48,13 @@ if (Get-ItemProperty -Path $runKey -Name $taskName -ErrorAction SilentlyContinue
     Write-Host "Removed legacy HKCU Run entry." -ForegroundColor DarkGray
 }
 
-# Build the scheduled task. Runs as current user, only when logged on - no UAC.
+# Also remove the obsolete watchdog task from earlier setup.ps1 versions.
+Unregister-ScheduledTask -TaskName "MCPVectorProxyWatchdog" -Confirm:$false -ErrorAction SilentlyContinue
+
+# Build the AtLogon trigger with 30s delay (network/profile readiness).
 $action = New-ScheduledTaskAction -Execute $nodePath -Argument "`"$trayScript`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$trigger.Delay = "PT30S"  # wait 30s after logon so the network/profile is ready
+$trigger.Delay = "PT30S"
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -64,7 +72,7 @@ Register-ScheduledTask `
     -Settings $settings `
     -Principal $principal `
     -Force | Out-Null
-Write-Host "Task Scheduler entry registered (AtLogon + 30s delay, retry on failure)." -ForegroundColor Green
+Write-Host "Main task registered (AtLogon + 30s delay, retry on failure)." -ForegroundColor Green
 
 # -- 4. Kill any old tray instance --------------------------------------------
 Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
@@ -103,7 +111,7 @@ if (Test-Path $makeExe) {
 }
 
 Write-Host "" -ForegroundColor Cyan
-Write-Host "Done! Tray auto-starts 30s after each login via Task Scheduler." -ForegroundColor Cyan
+Write-Host "Done! Tray auto-starts after login. Sleep/wake handled by Rust power events." -ForegroundColor Cyan
 Write-Host "Manual: double-click MCP-Proxy.exe, or run:" -ForegroundColor Cyan
 Write-Host "  Start-ScheduledTask -TaskName '$taskName'" -ForegroundColor DarkGray
 Write-Host "Uninstall:" -ForegroundColor Cyan
