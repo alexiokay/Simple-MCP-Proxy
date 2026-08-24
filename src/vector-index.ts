@@ -28,7 +28,7 @@ import { isToolAllowed } from "./filter.js";
 import type {
     ToolEntry, IndexResult, IndexMeta, DiscoverResult, LiveTool,
 } from "./types.js";
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type { Client } from "@modelcontextprotocol/client";
 
 // Point HuggingFace Transformers at our local model cache
 hfEnv.cacheDir = MODEL_CACHE;

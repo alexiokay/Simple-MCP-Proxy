@@ -3,8 +3,7 @@
  * Creates an MCP Server instance with discover/execute/batch/refresh tool handlers.
  * All state is injected via VectorIndex and RouterConnection — no globals.
  */
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { Server } from "@modelcontextprotocol/server";
 
 import { DISCOVER_LIMIT } from "./config.js";
 import type { VectorIndex } from "./vector-index.js";
@@ -27,7 +26,7 @@ export function createMCPServer(
 
     // ─── Tool definitions ───────────────────────────────────────────────────
 
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    server.setRequestHandler("tools/list", async () => ({
         tools: [
             {
                 name: "discover_tools",
@@ -100,12 +99,12 @@ export function createMCPServer(
                     "or after adding a new MCP server to your router.",
                 inputSchema: { type: "object" as const, properties: {} },
             },
-        ],
+        ] as any,
     }));
 
     // ─── Tool handlers ──────────────────────────────────────────────────────
 
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler("tools/call", async (request) => {
         const { name, arguments: args } = request.params;
 
         switch (name) {

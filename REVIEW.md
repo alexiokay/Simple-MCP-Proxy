@@ -30,7 +30,7 @@ Originally reviewed 2026-07-19. Fixes applied same day — see status column.
 
 | ID | Status | Notes |
 |---|---|---|
-| **L1** | TODO stub | SDK pin `^1.0.0` resolves to 1.29.0; **v2.0 lands 2026-07-28**. Added TODO comment in `index.ts` to verify `createMcpExpressApp` survives v2; migrate after the spec drops. |
+| **L1** ✅ | Fixed | Migrated to MCP TypeScript SDK v2 packages. `createMcpExpressApp` remains available from `@modelcontextprotocol/express`; Node Streamable HTTP uses `@modelcontextprotocol/node`; upstream clients use automatic version negotiation. |
 | **L2** ✅ | Bumped | TypeScript `^5.4.0` → `^5.9.0`. Latest is 7.0.2 (native Go compiler) — try after 5.9 is stable in CI. |
 | **L3** ✅ | Bumped | `@types/node ^20` → `^22` (Node 22 LTS; Node 20 hit EOL April 2026). |
 | **L4** ✅ | Dropped | SSE transport removed. No client was using it (Claude Desktop via stdio-bridge, Claude Code via Streamable HTTP). `/sse` and `/messages` routes gone; `sessions.sse` removed from /health. |
@@ -87,7 +87,7 @@ Mounted in `index.ts` before the session routes. `vector-index.ts` got a new `in
 | ST1, ST3 — pin CLI + log file | P1 | ✅ Fixed |
 | ST2, ST4 — absolute node path + Task Scheduler | P2 (promoted) | ✅ Fixed |
 | B4 — env whitelist | P2 | ✅ Fixed |
-| L1 — verify `createMcpExpressApp`, plan v2 migration | P2 | Open |
+| L1 — migrate to MCP SDK v2 and verify `createMcpExpressApp` | P2 | ✅ Done |
 | L2, L3 — bump TS + @types/node | P3 | ✅ Fixed |
 | L4 — drop SSE if unused | P3 | Open |
 | L5 — pin LanceDB exactly | P3 | ✅ Fixed |
@@ -98,7 +98,7 @@ Mounted in `index.ts` before the session routes. `vector-index.ts` got a new `in
 
 ## What's still open
 
-- **L1** — verify `createMcpExpressApp` survives SDK 1.29 → 2.0 (after July 28, 2026; TODO comment in `index.ts`)
+- **L1** — MCP SDK v2 migration is complete; typecheck and production build pass.
 - **S1 follow-up** — bearer-token gate when `ALLOW_REMOTE=1` (skipped — currently just a warning, not needed unless remote is enabled)
 
 ---
@@ -132,7 +132,11 @@ Security boundary for scoping what the proxy exposes to agents.
 
 | Dep | Pin | Latest | Action |
 |---|---|---|---|
-| `@modelcontextprotocol/sdk` | `^1.0.0` | 1.29.0 | Verify `createMcpExpressApp`; plan v2 migration (July 28) |
+| `@modelcontextprotocol/client` | `^2.0.0` ✅ | 2.0.0 | Client APIs + automatic version negotiation |
+| `@modelcontextprotocol/server` | `^2.0.0` ✅ | 2.0.0 | Server APIs + stdio transport |
+| `@modelcontextprotocol/core` | `^2.0.0` ✅ | 2.0.0 | MCP protocol types |
+| `@modelcontextprotocol/node` | `^2.0.0` ✅ | 2.0.0 | Node Streamable HTTP transport |
+| `@modelcontextprotocol/express` | `^2.0.0` ✅ | 2.0.0 | Express integration |
 | `typescript` | `^5.9.0` ✅ | 7.0.2 | Try 7.0 after 5.9 stabilizes |
 | `@types/node` | `^22.0.0` ✅ | 22.x / 24.x | Current |
 | `express` | `^5.2.1` | 5.x | Current |

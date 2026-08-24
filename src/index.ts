@@ -4,12 +4,9 @@
  * Wires together the VectorIndex, RouterConnection, and MCP Server,
  * then starts in either HTTP or stdio mode based on config.
  */
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-// TODO(post-2026-07-28): MCP SDK v2 ships alongside the 2026-07-28 spec.
-// Verify createMcpExpressApp still exists in v2; if not, migrate to the
-// inline transport pattern the SDK then recommends.
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
+import { createMcpExpressApp } from "@modelcontextprotocol/express";
 import express from "express";
 import { randomUUID } from "crypto";
 
@@ -68,7 +65,7 @@ function runHttp(port: number, host: string): void {
 
   // ── Streamable HTTP sessions ────────────────────────────────────────────
 
-  const streamableSessions = new Map<string, StreamableHTTPServerTransport>();
+  const streamableSessions = new Map<string, NodeStreamableHTTPServerTransport>();
 
   app.all("/mcp", async (req, res) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
@@ -80,7 +77,7 @@ function runHttp(port: number, host: string): void {
     }
     if (req.method !== "POST") { res.status(400).json({ error: "POST to /mcp to start a session." }); return; }
 
-    const transport = new StreamableHTTPServerTransport({
+    const transport = new NodeStreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sid) => { streamableSessions.set(sid, transport); log(`Session: ${sid}`); },
       onsessionclosed: (sid) => { streamableSessions.delete(sid); },
@@ -103,11 +100,11 @@ function runHttp(port: number, host: string): void {
     });
   });
 
-  // Listen without specifying host so Node binds to :: (dual-stack).
-  // This accepts both IPv4 (127.0.0.1) and IPv6 ([::1]) connections,
-  // fixing the issue where some MCP clients resolve 'localhost' to [::1].
-  app.listen(port, () => {
-    log(`HTTP on port ${port} (dual-stack: IPv4 + IPv6)`);
+  // Bind explicitly to the configured host. Leaving the host unspecified
+  // makes Node listen on all interfaces, which would expose the proxy even
+  // when HTTP_HOST is left at its local-only default.
+  app.listen(port, host, () => {
+    log(`HTTP on ${host}:${port}`);
     log(`  Streamable HTTP : POST/GET/DELETE /mcp`);
     log(`  Health          : GET /health`);
     log(`  Dashboard       : GET /`);

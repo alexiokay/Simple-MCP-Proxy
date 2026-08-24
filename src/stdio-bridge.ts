@@ -7,11 +7,9 @@
  *   "command": "node",
  *   "args": ["...dist/stdio-bridge.js"]
  */
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { Server } from "@modelcontextprotocol/server";
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 
 const PROXY_URL = process.env.PROXY_URL ?? "http://127.0.0.1:3456/mcp";
 const MAX_CONNECT_ATTEMPTS = 20;
@@ -32,7 +30,7 @@ async function connectWithRetry(): Promise<Client> {
     try {
       const client = new Client(
         { name: "stdio-bridge", version: "1.0.0" },
-        { capabilities: {} }
+        { capabilities: {}, versionNegotiation: { mode: "auto" } }
       );
       await client.connect(new StreamableHTTPClientTransport(new URL(PROXY_URL)));
       log("Connected to HTTP proxy.");
@@ -82,12 +80,12 @@ async function main() {
   );
 
   // Forward tools/list — reconnects transparently if proxy restarted
-  server.setRequestHandler(ListToolsRequestSchema, async () =>
+  server.setRequestHandler("tools/list", async () =>
     callWithReconnect((c) => c.listTools())
   );
 
   // Forward tools/call — reconnects transparently if proxy restarted
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  server.setRequestHandler("tools/call", async (req) => {
     const { name, arguments: args } = req.params;
     return callWithReconnect((c) => c.callTool({ name, arguments: args ?? {} }));
   });

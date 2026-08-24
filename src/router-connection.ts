@@ -5,9 +5,8 @@
  * Key fix: closes the previous StdioClientTransport before spawning a new one,
  * preventing orphan node processes from accumulating on each reconnect.
  */
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { Client } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import path from "path";
 
 import { MCPR_TOKEN, POLL_INTERVAL_MS, DIST_DIR, log, sleep } from "./config.js";
@@ -90,7 +89,7 @@ export class RouterConnection {
 
                 const client = new Client(
                     { name: "mcp-vector-proxy", version: "1.0.0" },
-                    { capabilities: {} },
+                    { capabilities: {}, versionNegotiation: { mode: "auto" } },
                 );
 
                 // Only trigger reconnect if we were fully connected
@@ -117,7 +116,7 @@ export class RouterConnection {
                 log("MCP Router connected.");
 
                 // Listen for tool list changes from the router
-                client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
+                client.setNotificationHandler("notifications/tools/list_changed", async () => {
                     log("Notification: tools changed — re-indexing...");
                     await this.vectorIndex.buildIndex(client, "notification");
                 });
