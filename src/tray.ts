@@ -220,13 +220,14 @@ function openUrl(url: string): void {
 
 function openLogFile(): void {
   if (IS_WIN) {
-    // Use `start` with proper quoting. The path may contain spaces
-    // (C:\Users\<name>\...), and unquoted it parses as multiple args.
-    // windowsHide:false so the editor shows up; detached so Node doesn't wait.
-    spawn("cmd.exe", ["/c", "start", "", `"${LOG_FILE}"`], {
+    // Use `start` with an explicit empty title (`""`) so cmd doesn't treat the
+    // file path as a window title. Don't manually quote LOG_FILE — Node's spawn
+    // already escapes args, and double-quoting produces malformed paths.
+    spawn("cmd.exe", ["/c", "start", '""', LOG_FILE], {
       detached: true,
       stdio: "ignore",
       windowsHide: false,
+      shell: false,
     }).unref();
   } else {
     openUrl(LOG_FILE);
